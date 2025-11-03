@@ -42,6 +42,7 @@ class SymbolInfo:
     swap_long: float
     swap_short: float
     spread: float
+    volume_step: float
 
 @dataclass
 class MarketCandle:
@@ -177,6 +178,9 @@ class MT5MarketDataRepository(IMarketDataRepository):
         spread = getattr(raw, "spread", 0)
         swap_long = getattr(raw, "swap_long", 0.0)
         swap_short = getattr(raw, "swap_short", 0.0)
+        volume_step = getattr(raw, "volume_step", 0.01)
+        if volume_step == 0.0:
+            volume_step = 0.01
         trade_tick_size = point
         return SymbolInfo(
             name=symbol,
@@ -187,6 +191,7 @@ class MT5MarketDataRepository(IMarketDataRepository):
             swap_long=float(swap_long),
             swap_short=float(swap_short),
             spread=float(spread),
+            volume_step=float(volume_step)
         )
 
     async def get_last_candles(self, symbol: str, timeframe: int, count: int) -> List[MarketCandle]:
@@ -255,6 +260,13 @@ class MT5TradeExecutionService(ITradeExecutionService):
             si = await loop.run_in_executor(self._connector.executor(), lambda: mt5.symbol_info(symbol))
             if si is None:
                 raise ValueError(f"Symbol not found: {symbol}")
+
+            volume_min = getattr(si, "volume_min", 0.01)
+
+            # Check if lot is too small
+            if lot < volume_min:
+                raise ValueError(f"Calculated lot {lot} is below minimum {volume_min} for {symbol}")
+
             price = si.ask if action == "buy" else si.bid
         else:
             price = info.ask if action == "buy" else info.bid
@@ -264,7 +276,7 @@ class MT5TradeExecutionService(ITradeExecutionService):
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
-            "volume": float(round(lot, 2)),  # round to 2 decimal places by default (adjust per broker)
+            "volume": float(lot),
             "type": order_type,
             "price": float(price),
             "sl": float(stop_loss) if stop_loss is not None else None,
@@ -347,7 +359,11 @@ class MT5TradeExecutionService(ITradeExecutionService):
 
 # -------------------------- Utilities & Helpers --------------------------------
 
-def calculate_lot_size(account_balance: float, risk_percent: float, stop_loss_pips: float, pip_value_per_lot: float) -> float:
+def calculate_lot_size(account_balance: float,
+                       risk_percent: float,
+                       stop_loss_pips: float,
+                       pip_value_per_lot: float,
+                       volume_step: float) -> float:
     """
     Deterministic lot size calculation.
     Lot Size = (Account Balance * risk_percent) / (stop_loss_pips * pip_value_per_lot)
@@ -355,12 +371,23 @@ def calculate_lot_size(account_balance: float, risk_percent: float, stop_loss_pi
     """
     if stop_loss_pips <= 0 or pip_value_per_lot <= 0:
         raise ValueError("stop_loss_pips and pip_value_per_lot must be positive")
+    if volume_step <= 0:
+        raise ValueError("volume_step must be positive")
+
     risk_usd = Decimal(str(account_balance)) * Decimal(str(risk_percent))
     denom = Decimal(str(stop_loss_pips)) * Decimal(str(pip_value_per_lot))
-    lot = (risk_usd / denom)
-    # floor to 2 decimals to avoid broker rejection; adjust behavior as needed
-    lot_quantized = float(math.floor(float(lot) * 100) / 100.0)
-    return lot_quantized
+    if denom == 0.0:
+        return 0.0
+    lot = float(risk_usd / denom)
+
+    # Correct rounding based on volume_step
+    # Example: lot=0.25, volume_step=0.1 -> 0.2
+    # Example: lot=0.25, volume_step=1.0 -> 0.0
+    lot_quantized = math.floor(lot / volume_step) * volume_step
+
+    # Return rounded to a safe number of decimals
+    return round(lot_quantized, 8)
+
 
 # -------------------------- Example Agent Integration ---------------------------
 
@@ -393,7 +420,7 @@ async def example_decision_cycle(symbol: str, timeframe: int = mt5.TIMEFRAME_M15
             stop_loss_price = latest.close - (info.point * 50)  # naive 50-pip stop if point corresponds to pip
             stop_loss_pips = abs((latest.close - stop_loss_price) / info.point)
             pip_value = 10.0  # user must compute exact pip value using account currency and pair
-            lot = calculate_lot_size(account.balance, 0.005, stop_loss_pips, pip_value)
+            lot = calculate_lot_size(account.balance, 0.005, stop_loss_pips, pip_value, info.volume_step)
             result = await exec_svc.place_market_order(symbol, "buy", lot, stop_loss_price, latest.close + (info.point * 100), comment="example")
             logger.info(f"Place order result: {result}")
         else:
