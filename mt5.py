@@ -837,14 +837,18 @@ __all__ = [
     "MT5Connector",
     "MT5MarketDataRepository",
     "MT5TradeExecutionService",
+    "PandasTAIndicatorService",
     # Dataclasses
     "SymbolInfo",
     "MarketCandle",
     "AccountState",
     "OrderResult",
+    "PositionInfo",
+    "TechnicalIndicators",
     # Protocols
     "IMarketDataRepository",
     "ITradeExecutionService",
+    "ITechnicalIndicatorService",
     # Utilities
     "calculate_lot_size",
 ]
