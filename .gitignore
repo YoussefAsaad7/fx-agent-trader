@@ -1,0 +1,101 @@
+# =========================
+# Python general
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.env/
+.env.local
+*.env
+
+# Byte-compiled / optimized / DLL files
+*.pyo
+*.pyd
+*.so
+*.dll
+*.dylib
+
+# =========================
+# Logs & runtime files
+# =========================
+*.log
+logs/
+nohup.out
+*.pid
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# =========================
+# OS-generated files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Databases / cache
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+trade_history.db
+*.bak
+
+# =========================
+# Build & packaging
+# =========================
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# =========================
+# Jupyter / Notebooks
+# =========================
+.ipynb_checkpoints
+*.ipynb
+
+# =========================
+# MT5 / Trading Agent specifics
+# =========================
+# MetaTrader configuration or cache files
+*.hst
+*.ex5
+*.mq5
+*.tpl
+*.set
+*.log
+
+# Agent data / cache
+cache/
+data/
+tmp/
+results/
+backtests/
+reports/
+
+# =========================
+# Environment & credentials
+# =========================
+config.json
+*.key
+*.pem
+*.crt
+*.pfx
+secret_*.*
+apikeys.json
+
+# =========================
+# Optional: Windows-specific
+# =========================
+*.bat~
+*.lnk
