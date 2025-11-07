@@ -40,7 +40,7 @@ from persistence import (
     PerformanceMetrics,
     ClosedTrade, SQLiteTradeRepository
 )
-
+from llm_client import ILLMClient
 logger = logging.getLogger(__name__)
 
 
@@ -82,17 +82,6 @@ class LLMFullDecision:
     # We add the context here so the executor can use it
     context: Optional[AgentFullContext] = None
 
-
-# --------------------------- Interfaces / Ports (SOLID) ---------------------------
-
-class ILLMClient(Protocol):
-    """
-    Interface (Port) for the LLM client.
-    """
-
-    async def call(self, system: str, user: str) -> str:
-        """Calls the LLM and returns a raw string response."""
-        ...
 
 
 # -------------------------- Engine (Orchestrator) ---------------------------
