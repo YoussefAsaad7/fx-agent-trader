@@ -609,6 +609,11 @@ async def example_decision_cycle(symbol: str, timeframe_int: int):
                     take_profit=take_profit_price,
                     comment="example-agent-buy"
                 )
+                t = result.ticket
+                logger.info(f"closing {t}")
+                await asyncio.sleep(10)
+                r = await exec_svc.close_position(ticket=t)
+                logger.info(f"closing result: {r}")
                 logger.info(f"Place order result: {result}")
             else:
                 logger.warning("Lot size calculated to 0.0. Order not placed. (SL too wide or risk too small?)")
@@ -649,7 +654,7 @@ if __name__ == "__main__":
     # Determine MT5 timeframe constant
     # mt5.TIMEFRAME_M15 = 15
     EXAMPLE_TIMEFRAME = 15
-    EXAMPLE_SYMBOL = "USOIL"
+    EXAMPLE_SYMBOL = "EURUSD"
 
 
     async def main():
