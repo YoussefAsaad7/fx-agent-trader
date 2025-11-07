@@ -2,19 +2,21 @@
 mt5_module.py
 A professional MT5 integration module designed for use with an autonomous trading agent.
 Principles: SOLID, Domain-Driven Design (DDD), asyncio, OOP.
-Dependencies: MetaTrader5 (pip install MetaTrader5)
+Dependencies: MetaTrader5 (pip install MetaTrader5), pandas-ta (pip install pandas-ta)
 
-Revision 2:
-- Implements `volume_step` for correct lot size calculation (Fixes crit-bug-1).
-- Implements `trade_tick_value` for robust pip value (Fixes crit-bug-2).
-- Removes the need for a separate PipValueCalculator class.
+Revision 3:
+- Added `PositionInfo` dataclass for open positions.
+- Added `TechnicalIndicators` dataclass for TA data.
+- Added `get_open_positions` to the data repository.
+- Added `ITechnicalIndicatorService` and `PandasTAIndicatorService` to
+  calculate EMA, MACD, RSI, and ATR from candle data.
 """
 
 from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Optional, Protocol, Tuple, Dict, Any
@@ -30,6 +32,17 @@ except Exception as e:
     mt5 = None  # type: ignore
     logger.warning(f"MetaTrader5 package not found or failed to import: {e}")
 
+# Try to import pandas-ta
+try:
+    import pandas as pd
+    import pandas_ta as ta
+except ImportError:
+    pd = None
+    ta = None
+    logger.warning("pandas and pandas-ta not found. Indicator service will not work.")
+    logger.warning("Please run: pip install pandas pandas-ta")
+
+
 
 # ----------------------------- Domain Layer (DDD) -----------------------------
 
@@ -41,13 +54,13 @@ class SymbolInfo:
     name: str
     point: float
     digits: int
-    spread: int  # Spread in integer points
+    spread: int                 # Spread in integer points
     trade_contract_size: float
 
     # Lot Sizing & Risk (CRITICAL)
-    volume_min: float  # Minimum trade volume (e.g., 0.01)
-    volume_step: float  # Lot step (e.g., 0.01 or 1.0)
-    trade_tick_value: float  # The value of 1.0 'point' for 1 lot in account currency
+    volume_min: float           # Minimum trade volume (e.g., 0.01)
+    volume_step: float          # Lot step (e.g., 0.01 or 1.0)
+    trade_tick_value: float     # The value of 1.0 'point' for 1 lot in account currency
 
     # Informational
     swap_long: float
@@ -55,7 +68,6 @@ class SymbolInfo:
     currency_base: str
     currency_profit: str
     currency_margin: str
-
 
 @dataclass
 class MarketCandle:
@@ -67,7 +79,6 @@ class MarketCandle:
     tick_volume: int
     spread: Optional[int] = None
 
-
 @dataclass
 class AccountState:
     login: int
@@ -77,13 +88,44 @@ class AccountState:
     margin_level: Optional[float]
     account_currency: str
 
-
 @dataclass
 class OrderResult:
     success: bool
     ticket: Optional[int]
     comment: Optional[str]
     raw: Optional[Dict[str, Any]] = None
+
+# --- NEW DATACLASSES FOR REVISION 3 ---
+
+@dataclass(frozen=True)
+class PositionInfo:
+    """
+    Domain model for an open trading position.
+    """
+    ticket: int
+    symbol: str
+    type: str  # 'buy' or 'sell'
+    volume: float
+    open_price: float
+    current_price: float
+    stop_loss: float
+    take_profit: float
+    profit: float
+    swap: float
+    comment: str
+
+@dataclass(frozen=True)
+class TechnicalIndicators:
+    """
+    Domain model for calculated indicators. All lists are oldest -> newest.
+    """
+    # Using field to allow default empty lists
+    ema_slow: List[float] = field(default_factory=list)
+    ema_fast: List[float] = field(default_factory=list)
+    macd: List[float] = field(default_factory=list)
+    macd_signal: List[float] = field(default_factory=list)
+    rsi: List[float] = field(default_factory=list)
+    atr: List[float] = field(default_factory=list)
 
 
 # --------------------------- Ports / Interfaces (SOLID) -------------------------
@@ -98,6 +140,11 @@ class IMarketDataRepository(Protocol):
     async def get_account_state(self) -> AccountState:
         ...
 
+    async def get_open_positions(self) -> List[PositionInfo]:
+        """
+        NEW: Fetches all open positions from the account.
+        """
+        ...
 
 class ITradeExecutionService(Protocol):
     async def place_market_order(self,
@@ -112,6 +159,20 @@ class ITradeExecutionService(Protocol):
     async def close_position(self, ticket: int) -> OrderResult:
         ...
 
+# --- NEW INTERFACE FOR REVISION 3 ---
+
+class ITechnicalIndicatorService(Protocol):
+    """
+    Interface for a service that calculates TA indicators from candle data.
+    """
+    async def calculate_indicators(self,
+                                     candles: List[MarketCandle],
+                                     fast_ema_period: int = 12,
+                                     slow_ema_period: int = 26,
+                                     macd_signal_period: int = 9,
+                                     rsi_period: int = 14,
+                                     atr_period: int = 14) -> TechnicalIndicators:
+        ...
 
 # -------------------------- Application / Infrastructure ------------------------
 
@@ -120,7 +181,6 @@ class MT5Connector:
     Responsible for initializing and shutting down the MetaTrader5 native connection.
     Keeps connection logic centralized (Single Responsibility).
     """
-
     def __init__(self):
         self._connected = False
         self._lock = asyncio.Lock()
@@ -145,8 +205,7 @@ class MT5Connector:
             loop = asyncio.get_running_loop()
             ok = await loop.run_in_executor(self._executor, mt5.initialize)
             if not ok:
-                raise ConnectionError(
-                    f"MT5 initialize failed: {mt5.last_error() if hasattr(mt5, 'last_error') else 'unknown'}")
+                raise ConnectionError(f"MT5 initialize failed: {mt5.last_error() if hasattr(mt5, 'last_error') else 'unknown'}")
             self._connected = True
             logger.info("MT5 initialized successfully.")
 
@@ -171,7 +230,6 @@ class MT5Connector:
             raise ConnectionError("MT5 is not connected. Cannot get executor.")
         return self._executor
 
-
 # -------------------------- Concrete Repository / Service -----------------------
 
 class MT5MarketDataRepository(IMarketDataRepository):
@@ -179,10 +237,9 @@ class MT5MarketDataRepository(IMarketDataRepository):
     Concrete implementation that fetches market data from MT5.
     Uses run_in_executor to keep library calls non-blocking for asyncio usage.
     """
-
     def __init__(self, connector: MT5Connector):
         if not isinstance(connector, MT5Connector):
-            raise TypeError("Expected MT5Connector instance")
+             raise TypeError("Expected MT5Connector instance")
         self._connector = connector
 
     async def get_symbol_info(self, symbol: str) -> SymbolInfo:
@@ -217,11 +274,11 @@ class MT5MarketDataRepository(IMarketDataRepository):
         # --- FIX 1: Volume Step ---
         volume_step = getattr(raw, "volume_step", 0.01)
         if volume_step == 0.0:
-            volume_step = 0.01  # Safety fallback
+            volume_step = 0.01 # Safety fallback
 
         volume_min = getattr(raw, "volume_min", 0.01)
         if volume_min == 0.0:
-            volume_min = 0.01  # Safety fallback
+            volume_min = 0.01 # Safety fallback
 
         # --- FIX 2: Tick Value ---
         # This is the value of 1.0 'point' for 1 lot in account currency
@@ -259,7 +316,6 @@ class MT5MarketDataRepository(IMarketDataRepository):
             raise RuntimeError("MetaTrader5 package not installed or not available.")
 
         loop = asyncio.get_running_loop()
-
         def _copy():
             return mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
 
@@ -296,20 +352,69 @@ class MT5MarketDataRepository(IMarketDataRepository):
             balance=float(raw.balance),
             equity=float(raw.equity),
             free_margin=float(getattr(raw, "margin_free", 0.0)),
-            margin_level=float(getattr(raw, "margin_level", 0.0)) if getattr(raw, "margin_level",
-                                                                             None) is not None else None,
+            margin_level=float(getattr(raw, "margin_level", 0.0)) if getattr(raw, "margin_level", None) is not None else None,
             account_currency=str(getattr(raw, "currency", "USD"))
         )
+
+    # --- NEW METHOD FOR REVISION 3 ---
+    async def get_open_positions(self) -> List[PositionInfo]:
+        """
+        Fetches and maps all open positions.
+        """
+        if mt5 is None:
+            raise RuntimeError("MetaTrader5 package not installed or not available.")
+
+        loop = asyncio.get_running_loop()
+
+        def _get_pos():
+            return mt5.positions_get() # Get all positions
+
+        raw_positions = await loop.run_in_executor(self._connector.executor(), _get_pos)
+
+        if raw_positions is None:
+            logger.warning(f"Could not fetch positions: {mt5.last_error()}")
+            return []
+
+        positions: List[PositionInfo] = []
+        for pos in raw_positions:
+            try:
+                # 0 = Buy, 1 = Sell
+                pos_type = "buy" if getattr(pos, "type", 0) == 0 else "sell"
+
+                # Get live price for profit calculation
+                symbol = getattr(pos, "symbol", "")
+                tick = await loop.run_in_executor(self._connector.executor(), lambda s=symbol: mt5.symbol_info_tick(s))
+
+                current_price = 0.0
+                if tick:
+                    current_price = tick.ask if pos_type == "sell" else tick.bid # Price to close
+
+                positions.append(PositionInfo(
+                    ticket=int(getattr(pos, "ticket", 0)),
+                    symbol=symbol,
+                    type=pos_type,
+                    volume=float(getattr(pos, "volume", 0.0)),
+                    open_price=float(getattr(pos, "price_open", 0.0)),
+                    current_price=float(current_price),
+                    stop_loss=float(getattr(pos, "sl", 0.0)),
+                    take_profit=float(getattr(pos, "tp", 0.0)),
+                    profit=float(getattr(pos, "profit", 0.0)),
+                    swap=float(getattr(pos, "swap", 0.0)),
+                    comment=str(getattr(pos, "comment", "")),
+                ))
+            except Exception as e:
+                logger.error(f"Error mapping position {getattr(pos, 'ticket', 'N/A')}: {e}")
+
+        return positions
 
 
 class MT5TradeExecutionService(ITradeExecutionService):
     """
     Trade execution service that encapsulates order placing and closing logic.
     """
-
     def __init__(self, connector: MT5Connector, default_deviation: int = 20):
         if not isinstance(connector, MT5Connector):
-            raise TypeError("Expected MT5Connector instance")
+             raise TypeError("Expected MT5Connector instance")
         self._connector = connector
         self._deviation = default_deviation  # max slippage in points
 
@@ -355,14 +460,11 @@ class MT5TradeExecutionService(ITradeExecutionService):
 
             # --- VALIDATION ---
             if lot < volume_min:
-                return OrderResult(success=False, ticket=None, comment=f"Lot size {lot} is below minimum {volume_min}",
-                                   raw=None)
+                return OrderResult(success=False, ticket=None, comment=f"Lot size {lot} is below minimum {volume_min}", raw=None)
 
             # Check if lot size adheres to volume step
-            if (Decimal(str(lot)) * 10 ** 8) % (Decimal(str(volume_step)) * 10 ** 8) != 0:
-                return OrderResult(success=False, ticket=None,
-                                   comment=f"Lot size {lot} has invalid step. Must be multiple of {volume_step}",
-                                   raw=None)
+            if (Decimal(str(lot)) * 10**8) % (Decimal(str(volume_step)) * 10**8) != 0:
+                 return OrderResult(success=False, ticket=None, comment=f"Lot size {lot} has invalid step. Must be multiple of {volume_step}", raw=None)
 
             order_type = mt5.ORDER_TYPE_BUY if action == "buy" else mt5.ORDER_TYPE_SELL
 
@@ -373,7 +475,7 @@ class MT5TradeExecutionService(ITradeExecutionService):
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": symbol,
-                "volume": float(lot),  # Already validated and rounded by calculate_lot_size
+                "volume": float(lot), # Already validated and rounded by calculate_lot_size
                 "type": order_type,
                 "price": price,
                 "sl": sl_price,
@@ -381,7 +483,7 @@ class MT5TradeExecutionService(ITradeExecutionService):
                 "deviation": int(self._deviation),
                 "magic": 123456,
                 "comment": comment or "auto-trade",
-                "type_filling": mt5.ORDER_FILLING_FOK,  # FOK is standard
+                "type_filling": mt5.ORDER_FILLING_FOK, # FOK is standard
             }
         except Exception as e:
             logger.error(f"Error preparing order request: {e}")
@@ -393,8 +495,7 @@ class MT5TradeExecutionService(ITradeExecutionService):
         result = await loop.run_in_executor(self._connector.executor(), _send)
 
         if result is None:
-            return OrderResult(success=False, ticket=None, comment=f"MT5 returned None. LastError: {mt5.last_error()}",
-                               raw=None)
+            return OrderResult(success=False, ticket=None, comment=f"MT5 returned None. LastError: {mt5.last_error()}", raw=None)
 
         try:
             retcode = getattr(result, "retcode", None)
@@ -403,8 +504,7 @@ class MT5TradeExecutionService(ITradeExecutionService):
             # 10009 is TRADE_RETCODE_DONE
             if retcode is not None and int(retcode) == 10009:
                 ticket = getattr(result, "order", None)
-                return OrderResult(success=True, ticket=int(ticket) if ticket is not None else None,
-                                   comment="Order placed", raw=result._asdict())
+                return OrderResult(success=True, ticket=int(ticket) if ticket is not None else None, comment="Order placed", raw=result._asdict())
 
             # If there is an error code, capture it
             comment = f"Order failed: retcode={retcode}, comment={getattr(result, 'comment', 'N/A')}"
@@ -438,8 +538,7 @@ class MT5TradeExecutionService(ITradeExecutionService):
 
         # get current price
         try:
-            price, _, _ = await self._get_live_price_and_min_volume(symbol,
-                                                                    "sell" if order_type == mt5.ORDER_TYPE_SELL else "buy")
+            price, _, _ = await self._get_live_price_and_min_volume(symbol, "sell" if order_type == mt5.ORDER_TYPE_SELL else "buy")
         except Exception as e:
             return OrderResult(success=False, ticket=None, comment=f"Failed to get closing price: {e}", raw=None)
 
@@ -462,24 +561,108 @@ class MT5TradeExecutionService(ITradeExecutionService):
         result = await loop.run_in_executor(self._connector.executor(), _send)
 
         if result is None:
-            return OrderResult(success=False, ticket=None, comment=f"MT5 returned None. LastError: {mt5.last_error()}",
-                               raw=None)
+            return OrderResult(success=False, ticket=None, comment=f"MT5 returned None. LastError: {mt5.last_error()}", raw=None)
 
         retcode = getattr(result, "retcode", None)
         if retcode is not None and int(retcode) == 10009:
-            return OrderResult(success=True, ticket=int(getattr(result, "order", None)), comment="Position closed",
-                               raw=result._asdict())
+            return OrderResult(success=True, ticket=int(getattr(result, "order", None)), comment="Position closed", raw=result._asdict())
 
         return OrderResult(success=False, ticket=None, comment=f"Close failed: retcode={retcode}", raw=result._asdict())
 
+# --- NEW SERVICE FOR REVISION 3 ---
+
+class PandasTAIndicatorService(ITechnicalIndicatorService):
+    """
+    Calculates TA indicators using the pandas-ta library.
+    This service is async to allow for non-blocking I/O if pandas-ta
+    were ever to become async, but here it runs calculations in the
+    default executor (via asyncio.to_thread) to avoid blocking the event loop.
+    """
+    def __init__(self):
+        if pd is None or ta is None:
+            raise ImportError("`pandas` and `pandas-ta` must be installed to use this service.")
+
+    async def calculate_indicators(self,
+                                     candles: List[MarketCandle],
+                                     fast_ema_period: int = 12,
+                                     slow_ema_period: int = 26,
+                                     macd_signal_period: int = 9,
+                                     rsi_period: int = 14,
+                                     atr_period: int = 14) -> TechnicalIndicators:
+
+        if len(candles) < max(slow_ema_period, rsi_period, atr_period):
+            logger.warning(f"Not enough candles ({len(candles)}) to calculate indicators.")
+            return TechnicalIndicators()
+
+        # Run the blocking pandas logic in a separate thread
+        return await asyncio.to_thread(
+            self._calculate_sync,
+            candles,
+            fast_ema_period,
+            slow_ema_period,
+            macd_signal_period,
+            rsi_period,
+            atr_period
+        )
+
+    def _calculate_sync(self,
+                        candles: List[MarketCandle],
+                        fast_ema_period: int,
+                        slow_ema_period: int,
+                        macd_signal_period: int,
+                        rsi_period: int,
+                        atr_period: int) -> TechnicalIndicators:
+
+        # 1. Convert list of dataclasses to pandas DataFrame
+        df = pd.DataFrame([vars(c) for c in candles])
+        if df.empty:
+            return TechnicalIndicators()
+
+        df.set_index('time', inplace=True)
+        # Ensure correct dtypes
+        df['open'] = pd.to_numeric(df['open'])
+        df['high'] = pd.to_numeric(df['high'])
+        df['low'] = pd.to_numeric(df['low'])
+        df['close'] = pd.to_numeric(df['close'])
+
+        # 2. Calculate Indicators using pandas-ta
+        # EMA
+        df.ta.ema(length=fast_ema_period, append=True, col_names='ema_fast')
+        df.ta.ema(length=slow_ema_period, append=True, col_names='ema_slow')
+
+        # MACD
+        # This appends 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9'
+        df.ta.macd(fast=fast_ema_period, slow=slow_ema_period, signal=macd_signal_period, append=True)
+
+        # RSI
+        df.ta.rsi(length=rsi_period, append=True, col_names='rsi')
+
+        # ATR
+        df.ta.atr(length=atr_period, append=True, col_names='atr')
+
+        # 3. Clean and convert back to lists
+        df.fillna(0.0, inplace=True) # Replace NaNs with 0.0 for the agent
+
+        # Dynamically get MACD column names
+        macd_col = f'MACD_{fast_ema_period}_{slow_ema_period}_{macd_signal_period}'
+        signal_col = f'MACDs_{fast_ema_period}_{slow_ema_period}_{macd_signal_period}'
+
+        return TechnicalIndicators(
+            ema_fast=df['ema_fast'].tolist(),
+            ema_slow=df['ema_slow'].tolist(),
+            macd=df[macd_col].tolist() if macd_col in df.columns else [],
+            macd_signal=df[signal_col].tolist() if signal_col in df.columns else [],
+            rsi=df['rsi'].tolist(),
+            atr=df['atr'].tolist()
+        )
 
 # -------------------------- Utilities & Helpers --------------------------------
 
 def calculate_lot_size(account_balance: float,
-                       risk_percent: float,
-                       stop_loss_pips: float,
-                       pip_value_per_lot: float,
-                       volume_step: float) -> float:
+                         risk_percent: float,
+                         stop_loss_pips: float,
+                         pip_value_per_lot: float,
+                         volume_step: float) -> float:
     """
     Deterministic lot size calculation based on the agent's prompt.
 
@@ -519,7 +702,6 @@ def calculate_lot_size(account_balance: float,
     # Return rounded to a safe number of decimals
     return round(lot_quantized, 8)
 
-
 # -------------------------- Example Agent Integration ---------------------------
 
 async def example_decision_cycle(symbol: str, timeframe_int: int):
@@ -541,14 +723,28 @@ async def example_decision_cycle(symbol: str, timeframe_int: int):
         repo = MT5MarketDataRepository(connector)
         exec_svc = MT5TradeExecutionService(connector)
 
+        # --- NEW: Setup indicator service ---
+        indicator_svc = None
+        if pd and ta:
+            indicator_svc = PandasTAIndicatorService()
+        else:
+            logger.error("Pandas/TA-Lib not found. Skipping indicator calculation.")
+            return
+
         # 1. Get Account and Symbol Info (This is what the agent's "context" would be)
         account = await repo.get_account_state()
         logger.info(f"Account: {account}")
 
+        # --- NEW: Get Open Positions ---
+        positions = await repo.get_open_positions()
+        logger.info(f"Open Positions: {len(positions)}")
+        for pos in positions:
+            logger.info(f"  -> {pos.symbol} {pos.type} {pos.volume} @ {pos.open_price} (Ticket: {pos.ticket})")
+
         info = await repo.get_symbol_info(symbol)
         logger.info(f"SymbolInfo: {info}")
 
-        candles = await repo.get_last_candles(symbol, timeframe_int, 10)
+        candles = await repo.get_last_candles(symbol, timeframe_int, 200) # count must be above max of specified periods for indicators
         if not candles or len(candles) < 2:
             logger.warning("Not enough candle data to make a decision.")
             return
@@ -556,25 +752,38 @@ async def example_decision_cycle(symbol: str, timeframe_int: int):
         latest = candles[-1]
         previous = candles[-2]
 
+        # --- NEW: Calculate Indicators ---
+        indicators = await indicator_svc.calculate_indicators(candles, rsi_period=14)
+        if indicators.rsi:
+            logger.info(f"Indicators: Latest RSI: {indicators.rsi[-1]} {indicators.atr} {indicators.macd} {indicators.macd_signal} {indicators.ema_fast} {indicators.ema_slow}")
+
         # 2. Agent Decision Logic (Example)
-        # Simple signal: if price broke previous high, buy
-        if latest.close > previous.high or True:
-            logger.info("Signal: Price broke previous high. Preparing BUY order.")
+        # Simple signal: if price broke previous high AND RSI not overbought
+        is_overbought = indicators.rsi[-1] > 70 if indicators.rsi else False
+
+        if latest.close > previous.high and not is_overbought:
+            logger.info("Signal: Price broke previous high & not overbought. Preparing BUY order.")
 
             # --- AGENT'S RISK MANAGEMENT ---
 
             # 1. Define SL price
-            # Naive SL: 1x ATR (just an example, ATR not calculated here)
-            # Let's use 500 points
-            stop_loss_points = 500
+            # Naive SL: 1x ATR
+            stop_loss_points = 0
+            if indicators.atr:
+                stop_loss_points = int(indicators.atr[-1] / info.point)
+            else:
+                stop_loss_points = 500 # Fallback
+
+            logger.info(f"Using SL of {stop_loss_points} points based on ATR: {indicators.atr[-1] if indicators.atr else 'N/A'}")
+
             stop_loss_price = latest.close - (stop_loss_points * info.point)
 
             # 2. Define TP price
-            take_profit_points = 1000  # 2:1 R:R
+            take_profit_points = stop_loss_points * 2 # 2:1 R:R
             take_profit_price = latest.close + (take_profit_points * info.point)
 
             # 3. Define Risk %
-            risk_percent = 0.01  # 1% risk
+            risk_percent = 0.01 # 1% risk
 
             # 4. Calculate Lot Size (USING THE NEW, ROBUST METHOD)
 
@@ -596,8 +805,7 @@ async def example_decision_cycle(symbol: str, timeframe_int: int):
                 volume_step=volume_step
             )
 
-            logger.info(
-                f"Calculated Lot: {lot} (Risk: {risk_percent * 100}%, SL Pips: {stop_loss_in_pips}, PipVal: {pip_value_per_lot}, VolStep: {volume_step})")
+            logger.info(f"Calculated Lot: {lot} (Risk: {risk_percent*100}%, SL Pips: {stop_loss_in_pips}, PipVal: {pip_value_per_lot}, VolStep: {volume_step})")
 
             # 5. Place Order
             if lot > 0:
@@ -609,11 +817,6 @@ async def example_decision_cycle(symbol: str, timeframe_int: int):
                     take_profit=take_profit_price,
                     comment="example-agent-buy"
                 )
-                t = result.ticket
-                logger.info(f"closing {t}")
-                await asyncio.sleep(10)
-                r = await exec_svc.close_position(ticket=t)
-                logger.info(f"closing result: {r}")
                 logger.info(f"Place order result: {result}")
             else:
                 logger.warning("Lot size calculated to 0.0. Order not placed. (SL too wide or risk too small?)")
@@ -626,7 +829,6 @@ async def example_decision_cycle(symbol: str, timeframe_int: int):
     finally:
         if connector.connected:
             await connector.disconnect()
-
 
 # ------------------------------- Module Export ---------------------------------
 
@@ -656,11 +858,10 @@ if __name__ == "__main__":
     EXAMPLE_TIMEFRAME = 15
     EXAMPLE_SYMBOL = "EURUSD"
 
-
     async def main():
         logger.info(f"--- Running MT5 Module Example for {EXAMPLE_SYMBOL} ({EXAMPLE_TIMEFRAME}) ---")
         await example_decision_cycle(EXAMPLE_SYMBOL, EXAMPLE_TIMEFRAME)
         logger.info("--- Example run complete ---")
 
-
     asyncio.run(main())
+
