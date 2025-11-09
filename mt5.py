@@ -120,6 +120,7 @@ class PositionInfo:
     profit: float
     swap: float
     comment: str
+    open_time: datetime
 
 @dataclass(frozen=True)
 class TechnicalIndicators:
@@ -411,6 +412,7 @@ class MT5MarketDataRepository(IMarketDataRepository):
                     profit=float(getattr(pos, "profit", 0.0)),
                     swap=float(getattr(pos, "swap", 0.0)),
                     comment=str(getattr(pos, "comment", "")),
+                    open_time=datetime.fromtimestamp(int(getattr(pos, "time", 0)), tz=timezone.utc),
                 ))
             except Exception as e:
                 logger.error(f"Error mapping position {getattr(pos, 'ticket', 'N/A')}: {e}")

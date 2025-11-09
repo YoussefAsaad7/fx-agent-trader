@@ -458,7 +458,7 @@ class ForexAgentEngine:
                     # We need the open time. pos_to_close doesn't have it, PositionInfo needs modification
                     # To fix this, mt5_module.py's get_open_positions should also fetch `pos.time`
                     # Assuming we can get open_time...
-                    open_time = datetime.utcnow()  # Mock: Replace with actual pos.time
+                    open_time = pos_to_close.open_time
 
                     closed_trade = ClosedTrade(
                         id=None,
