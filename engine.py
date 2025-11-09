@@ -28,7 +28,7 @@ from mt5 import (
     PositionInfo,
     calculate_lot_size,
     OrderResult,
-    TechnicalIndicators, MarketCandle, ITechnicalIndicatorService
+    TechnicalIndicators, MarketCandle, ITechnicalIndicatorService, TickQuote
 )
 from agent_context_builder import (
     AgentContextBuilder,
@@ -307,18 +307,16 @@ class ForexAgentEngine:
 
             info = sym_ctx.symbol_info
 
-            # 3. Get live price (for SL points calculation)
+            # 3. Get live tick (for SL points calculation)
             try:
-                # We need MarketDataRepo to get the *current* quote
-                # Note: get_symbol_info in our module returns SymbolInfo,
-                # but we need a quote. We should have a get_tick() method in the repo.
-                # For demonstration, we'll use the latest candle's close price
-                if not sym_ctx.market_data:
-                    d._validation_error = "No candle data available to get entry price"
+                tick = await self._market_repo.get_tick(d.symbol)
+                if not tick:
+                    d._validation_error = f"Failed to get live tick for {d.symbol}"
                     return
 
-                # Use last close of H1 data (or M5, whichever exists)
-                live_price = sym_ctx.market_data[0].candles[-1].close
+                # Use bid/ask depending on direction
+                live_price = tick.ask if d.action == "buy_to_enter" else tick.bid
+
 
             except Exception as e:
                 d._validation_error = f"Failed to get live price: {e}"
@@ -540,6 +538,9 @@ async def main():
             return AccountState(123, 10000.0, 10000.0, 10000.0, 100.0, 'USD')
 
         async def get_open_positions(self) -> List: return []
+
+        async def get_tick(self, symbol: str) -> Optional[TickQuote]:
+            return TickQuote("EURUSD", 1.3455, 1.3456, 1111112333)
 
     class MockIndicatorSvc(ITechnicalIndicatorService):
         async def calculate_indicators(self, *args, **kwargs):
