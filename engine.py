@@ -28,7 +28,7 @@ from mt5 import (
     PositionInfo,
     calculate_lot_size,
     OrderResult,
-    TechnicalIndicators, MarketCandle, ITechnicalIndicatorService
+    TechnicalIndicators, MarketCandle, ITechnicalIndicatorService, TickQuote
 )
 from agent_context_builder import (
     AgentContextBuilder,
@@ -538,6 +538,9 @@ async def main():
             return AccountState(123, 10000.0, 10000.0, 10000.0, 100.0, 'USD')
 
         async def get_open_positions(self) -> List: return []
+
+        async def get_tick(self, symbol: str) -> Optional[TickQuote]:
+            return TickQuote("EURUSD", 1.3455, 1.3456, 1111112333)
 
     class MockIndicatorSvc(ITechnicalIndicatorService):
         async def calculate_indicators(self, *args, **kwargs):

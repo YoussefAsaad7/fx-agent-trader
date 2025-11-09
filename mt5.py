@@ -421,10 +421,14 @@ class MT5MarketDataRepository(IMarketDataRepository):
         """
         Returns the latest live tick (bid/ask) for the given symbol.
         """
-        tick = mt5.symbol_info_tick(symbol)
-        if not tick:
-            return None
-        return TickQuote(symbol, tick.bid, tick.ask, tick.time)
+        def _fetch_tick():
+            tick = mt5.symbol_info_tick(symbol)
+            if not tick:
+                return None
+            return TickQuote(symbol, tick.bid, tick.ask, tick.time)
+
+        # Run MT5 call in a thread executor
+        return await asyncio.to_thread(_fetch_tick)
 
 
 class MT5TradeExecutionService(ITradeExecutionService):
@@ -742,6 +746,8 @@ async def example_decision_cycle(symbol: str, timeframe_int: int):
         repo = MT5MarketDataRepository(connector)
         exec_svc = MT5TradeExecutionService(connector)
 
+        tick = await repo.get_tick("EURUSD")
+        logger.info(f"Live EURUSD Tick {tick}")
         # --- NEW: Setup indicator service ---
         indicator_svc = None
         if pd and ta:
