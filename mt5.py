@@ -70,6 +70,13 @@ class SymbolInfo:
     currency_margin: str
 
 @dataclass
+class TickQuote:
+    symbol: str
+    bid: float
+    ask: float
+    time: float
+
+@dataclass
 class MarketCandle:
     time: datetime  # UTC
     open: float
@@ -144,6 +151,9 @@ class IMarketDataRepository(Protocol):
         """
         NEW: Fetches all open positions from the account.
         """
+        ...
+
+    async def get_tick(self, symbol: str) -> Optional[TickQuote]:
         ...
 
 class ITradeExecutionService(Protocol):
@@ -406,6 +416,15 @@ class MT5MarketDataRepository(IMarketDataRepository):
                 logger.error(f"Error mapping position {getattr(pos, 'ticket', 'N/A')}: {e}")
 
         return positions
+
+    async def get_tick(self, symbol: str) -> Optional[TickQuote]:
+        """
+        Returns the latest live tick (bid/ask) for the given symbol.
+        """
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            return None
+        return TickQuote(symbol, tick.bid, tick.ask, tick.time)
 
 
 class MT5TradeExecutionService(ITradeExecutionService):
