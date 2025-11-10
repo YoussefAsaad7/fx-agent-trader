@@ -228,7 +228,7 @@ Optimize your analysis:
 
 1.  Read the entire user prompt carefully before deciding.
 2.  Verify your **Lot Size** calculation (double-check the math).
-3.  Ensure your JSON output is valid and complete.
+3.  Ensure your JSON output is valid and complete and always make sure its wrapped in square brackets [] even if it's single json object.
 4.  Provide honest confidence scores (don't overstate conviction).
 5.  Be consistent with your exit plans.
 
