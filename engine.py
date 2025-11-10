@@ -87,8 +87,11 @@ class LLMFullDecision:
 # -------------------------- Engine (Orchestrator) ---------------------------
 
 # Regex ported from Go example for robust LLM output parsing
-RE_JSON_FENCE = re.compile(r'(?is)' + r"```json\s*(\[\s*\{.*?\}\s*\])\s*```")
-RE_JSON_ARRAY = re.compile(r'(?is)\[\s*\{.*?\}\s*\]')
+RE_JSON_FENCE = re.compile(r'(?is)' + r"```json\s*(\[\s*\{.*?\}\s*\])\s*```")# Find Array
+RE_JSON_ARRAY = re.compile(r'(?is)\[\s*\{.*?\}\s*\]') # Find Array
+RE_JSON_FENCE_OBJ = re.compile(r'(?is)' + r"```json\s*(\{.*?\})\s*```") # Find object
+RE_JSON_OBJ = re.compile(r'(?is)(\{.*?\})') # Find object
+
 RE_INVISIBLE = re.compile(r'[\u200B\u200C\u200D\uFEFF]')
 RE_REASONING_TAG = re.compile(r'(?s)<reasoning>(.*?)</reasoning>')
 
@@ -205,7 +208,7 @@ class ForexAgentEngine:
                 if inds.atr:
                     lines.append(f"    ATR:      [{', '.join([f'{x:.5f}' for x in inds.atr[slice_len:]])}]")
 
-        lines.append("\n---\nAnalyze the data and provide your decision JSON.")
+        lines.append("\n---\nAnalyze the data. Provide your reasoning in <reasoning> tags, then provide a JSON array of decisions.")
         return "\n".join(lines)
 
     def _extract_cot(self, raw: str) -> str:
@@ -217,8 +220,13 @@ class ForexAgentEngine:
         if match:
             return match.group(1).strip()
 
-        # 2. Fallback: get all content before JSON
-        json_match = RE_JSON_FENCE.search(raw) or RE_JSON_ARRAY.search(raw)
+        # 2. Fallback: get all content before any JSON block (array or object)
+        json_match = (
+                RE_JSON_FENCE.search(raw) or
+                RE_JSON_ARRAY.search(raw) or
+                RE_JSON_FENCE_OBJ.search(raw) or
+                RE_JSON_OBJ.search(raw)
+        )
         if json_match:
             return raw[:json_match.start()].strip()
 
@@ -242,24 +250,42 @@ class ForexAgentEngine:
         s = self._clean_json_str(raw)
 
         json_text = ""
-        # 1. Try ```json fence
+        is_object = False
+
+        # 1. Try ```json [ ... ]``` (fenced array)
         match = RE_JSON_FENCE.search(s)
         if match:
             json_text = match.group(1)
         else:
-            # 2. Fallback: find first JSON array
+            # 2. Try [ ... ] (raw array)
             match = RE_JSON_ARRAY.search(s)
             if match:
                 json_text = match.group(0)
-
+            else:
+                # 3. Try ```json { ... }``` (fenced object)
+                match = RE_JSON_FENCE_OBJ.search(s)
+                if match:
+                    json_text = match.group(1)
+                    is_object = True
+                else:
+                    # 4. Try { ... } (raw object)
+                    match = RE_JSON_OBJ.search(s)
+                    if match:
+                        json_text = match.group(0)
+                        is_object = True
         if not json_text:
-            logger.warning("No JSON array found in LLM response.")
+            logger.warning("No JSON block (array or object) found in LLM response.")
             return []
 
         try:
             # Parse JSON
             data = json.loads(json_text)
             decisions = []
+
+            # If it was a single object, wrap it in a list
+            if is_object:
+                data = [data]
+
             for item in data:
                 # Check if it's a valid dict
                 if not isinstance(item, dict):
