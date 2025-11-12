@@ -60,14 +60,12 @@ class SymbolInfo:
     # Lot Sizing & Risk (CRITICAL)
     volume_min: float           # Minimum trade volume (e.g., 0.01)
     volume_step: float          # Lot step (e.g., 0.01 or 1.0)
+    volume_max: float
     trade_tick_value: float     # The value of 1.0 'point' for 1 lot in account currency
 
     # Informational
     swap_long: float
     swap_short: float
-    currency_base: str
-    currency_profit: str
-    currency_margin: str
 
 @dataclass
 class TickQuote:
@@ -93,7 +91,7 @@ class AccountState:
     equity: float
     free_margin: float
     margin_level: Optional[float]
-    account_currency: str
+    currency: str
 
 @dataclass
 class OrderResult:
@@ -106,21 +104,34 @@ class OrderResult:
 
 @dataclass(frozen=True)
 class PositionInfo:
-    """
-    Domain model for an open trading position.
-    """
+    """Consolidated info about an open position."""
     ticket: int
     symbol: str
-    type: str  # 'buy' or 'sell'
+    type: int # 0 for BUY, 1 for SELL
     volume: float
     open_price: float
-    current_price: float
-    stop_loss: float
-    take_profit: float
+    open_time: datetime
     profit: float
     swap: float
     comment: str
+    current_price: float
+    stop_loss: float
+    take_profit: float
+
+@dataclass(frozen=True)
+class PositionHistoryInfo:
+    """Consolidated info about a *closed* trade deal."""
+    ticket: int
+    symbol: str
+    type: int # 0 for BUY, 1 for SELL
+    volume: float
+    open_price: float
+    close_price: float
     open_time: datetime
+    close_time: datetime
+    profit: float
+    swap: float
+    comment: str
 
 @dataclass(frozen=True)
 class TechnicalIndicators:
@@ -139,6 +150,8 @@ class TechnicalIndicators:
 # --------------------------- Ports / Interfaces (SOLID) -------------------------
 
 class IMarketDataRepository(Protocol):
+    """Interface for fetching market and account data."""
+
     async def get_symbol_info(self, symbol: str) -> SymbolInfo:
         ...
 
@@ -151,6 +164,13 @@ class IMarketDataRepository(Protocol):
     async def get_open_positions(self) -> List[PositionInfo]:
         """
         NEW: Fetches all open positions from the account.
+        """
+        ...
+
+    async def get_historical_trade(self, ticket: int) -> Optional[PositionHistoryInfo]:
+        """
+        Fetches the deal history for a specific position ticket
+        to find its closing details.
         """
         ...
 
@@ -167,7 +187,9 @@ class ITradeExecutionService(Protocol):
                                  comment: Optional[str]) -> OrderResult:
         ...
 
-    async def close_position(self, ticket: int) -> OrderResult:
+    async def close_position(self,
+                             position: PositionInfo,
+                             comment: Optional[str]) -> OrderResult: # <-- MODIFIED
         ...
 
 # --- NEW INTERFACE FOR REVISION 3 ---
@@ -189,14 +211,15 @@ class ITechnicalIndicatorService(Protocol):
 
 class MT5Connector:
     """
-    Responsible for initializing and shutting down the MetaTrader5 native connection.
-    Keeps connection logic centralized (Single Responsibility).
+    Handles the lifecycle of the MetaTrader5 connection.
+    Uses ThreadPoolExecutor to run blocking C-lib calls asynchronously.
     """
     def __init__(self):
+
         self._connected = False
         self._lock = asyncio.Lock()
         # ThreadPoolExecutor for converting blocking MT5 calls to async-friendly calls
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="MT5Worker")
 
     async def __aenter__(self):
         await self.connect()
@@ -206,27 +229,38 @@ class MT5Connector:
         await self.disconnect()
 
     async def connect(self) -> None:
+        """Initializes the MT5 connection."""
         async with self._lock:
             if self._connected:
                 return
             if mt5 is None:
-                logger.warning("MetaTrader5 package not available in this environment.")
-                self._connected = False
-                return
+                logger.error("MetaTrader5 package not available. Cannot connect.")
+                raise ImportError("MetaTrader5 package not installed.")
+
             loop = asyncio.get_running_loop()
-            ok = await loop.run_in_executor(self._executor, mt5.initialize)
+
+            # mt5.initialize() is blocking
+            ok = await loop.run_in_executor(
+                self._executor,
+                mt5.initialize
+            )
+
             if not ok:
-                raise ConnectionError(f"MT5 initialize failed: {mt5.last_error() if hasattr(mt5, 'last_error') else 'unknown'}")
+                await self._log_mt5_error("MT5 initialize failed")
+                raise ConnectionError("Failed to initialize MT5. Check path.")
+
+
+
             self._connected = True
-            logger.info("MT5 initialized successfully.")
+            logger.info("MT5 initialized and login successful.")
 
     async def disconnect(self) -> None:
+        """Shuts down the MT5 connection."""
         async with self._lock:
-            if not self._connected:
-                return
-            if mt5 is None:
+            if not self._connected or mt5 is None:
                 self._connected = False
                 return
+
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(self._executor, mt5.shutdown)
             self._connected = False
@@ -237,187 +271,201 @@ class MT5Connector:
         return self._connected
 
     def executor(self):
-        if not self._connected:
-            raise ConnectionError("MT5 is not connected. Cannot get executor.")
+        """Provides access to the executor for services to use."""
         return self._executor
+
+    async def _log_mt5_error(self, message: str):
+        """Helper to log the last MT5 error."""
+        if mt5 is None:
+            logger.error(message)
+            return
+
+        loop = asyncio.get_running_loop()
+        last_error = await loop.run_in_executor(self._executor, mt5.last_error)
+        logger.error(f"{message}: {last_error}")
 
 # -------------------------- Concrete Repository / Service -----------------------
 
 class MT5MarketDataRepository(IMarketDataRepository):
     """
-    Concrete implementation that fetches market data from MT5.
-    Uses run_in_executor to keep library calls non-blocking for asyncio usage.
+    Concrete implementation that fetches market and account data from MT5.
     """
     def __init__(self, connector: MT5Connector):
-        if not isinstance(connector, MT5Connector):
-             raise TypeError("Expected MT5Connector instance")
+        if mt5 is None:
+            raise ImportError("MetaTrader5 package not installed.")
         self._connector = connector
+        self._executor = self._connector.executor()
+
+    async def _run_in_executor(self, blocking_func, *args, **kwargs):
+        """Helper to run a blocking function in the connector's thread pool."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: blocking_func(*args, **kwargs)
+        )
 
     async def get_symbol_info(self, symbol: str) -> SymbolInfo:
-        if mt5 is None:
-            raise RuntimeError("MetaTrader5 package not installed or not available.")
-
-        loop = asyncio.get_running_loop()
-
-        # 1. Get full SymbolInfo object
-        raw = await loop.run_in_executor(self._connector.executor(), lambda: mt5.symbol_info(symbol))
+        """Fetches and normalizes symbol information."""
+        raw = await self._run_in_executor(mt5.symbol_info, symbol)
         if raw is None:
-            raise ValueError(f"Symbol {symbol} not found in MT5 terminal.")
+            raise ValueError(f"Symbol {symbol} not found or not available.")
 
-        # 2. Get tick info for live spread
-        tick = await loop.run_in_executor(self._connector.executor(), lambda: mt5.symbol_info_tick(symbol))
-        if tick is None:
-            logger.warning(f"Could not fetch tick for {symbol}, spread may be stale.")
-            # Use spread from symbol_info if tick fails
-            spread = getattr(raw, "spread", 0)
-        else:
-            # Live spread from tick is more accurate
-            spread = getattr(tick, "spread", getattr(raw, "spread", 0))
+        # Helper to safely get attributes
+        def _get(attr, default):
+            return getattr(raw, attr, default)
 
-        # 3. Extract critical fields
-        point = getattr(raw, "point", 0.0)
-        if point == 0.0:
-            point = 10 ** (-getattr(raw, "digits", 5))
-
-        digits = getattr(raw, "digits", 5)
-        contract_size = getattr(raw, "trade_contract_size", 100000.0)
-
-        # --- FIX 1: Volume Step ---
-        volume_step = getattr(raw, "volume_step", 0.01)
-        if volume_step == 0.0:
-            volume_step = 0.01 # Safety fallback
-
-        volume_min = getattr(raw, "volume_min", 0.01)
-        if volume_min == 0.0:
-            volume_min = 0.01 # Safety fallback
-
-        # --- FIX 2: Tick Value ---
-        # This is the value of 1.0 'point' for 1 lot in account currency
-        # Use trade_tick_value_profit for longs, _loss for shorts.
-        # We'll use the 'profit' one as the standard. Agent can adapt if needed.
-        trade_tick_value = getattr(raw, "trade_tick_value_profit", getattr(raw, "trade_tick_value", 0.0))
-        if trade_tick_value == 0.0:
-            # Fallback calculation if broker field is empty (rare)
-            logger.warning(f"trade_tick_value is 0 for {symbol}. Calculating fallback.")
-            trade_tick_value = point * contract_size
-            # This fallback is only correct if profit currency == account currency
+        # MT5's 'point' is the *actual* tick size (e.g., 1e-05)
+        # We use trade_tick_value which is the value of one 'point'
+        # move for 1.0 lot in account currency.
+        point = float(_get("point", 10 ** (-_get("digits", 5))))
 
         return SymbolInfo(
             name=symbol,
-            point=float(point),
-            digits=int(digits),
-            spread=int(spread),
-            trade_contract_size=float(contract_size),
-
-            # Critical fields
-            volume_min=float(volume_min),
-            volume_step=float(volume_step),
-            trade_tick_value=float(trade_tick_value),
-
-            # Informational
-            swap_long=float(getattr(raw, "swap_long", 0.0)),
-            swap_short=float(getattr(raw, "swap_short", 0.0)),
-            currency_base=getattr(raw, "currency_base", ""),
-            currency_profit=getattr(raw, "currency_profit", ""),
-            currency_margin=getattr(raw, "currency_margin", ""),
+            point=point,
+            digits=int(_get("digits", 5)),
+            trade_tick_value=float(_get("trade_tick_value", point * _get("trade_contract_size", 100000))),
+            trade_contract_size=float(_get("trade_contract_size", 100000)),
+            swap_long=float(_get("swap_long", 0.0)),
+            swap_short=float(_get("swap_short", 0.0)),
+            spread=int(_get("spread", 0)),
+            volume_min=float(_get("volume_min", 0.01)),
+            volume_max=float(_get("volume_max", 100.0)),
+            volume_step=float(_get("volume_step", 0.01))
         )
 
     async def get_last_candles(self, symbol: str, timeframe: int, count: int) -> List[MarketCandle]:
-        if mt5 is None:
-            raise RuntimeError("MetaTrader5 package not installed or not available.")
+        """Fetches the last 'count' candles for a symbol."""
+        raw_tuples = await self._run_in_executor(
+            mt5.copy_rates_from_pos,
+            symbol, timeframe, 0, count
+        )
 
-        loop = asyncio.get_running_loop()
-        def _copy():
-            return mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+        if raw_tuples is None or len(raw_tuples) == 0:
+            logger.warning(f"No candle data returned for {symbol} T={timeframe}")
+            return []
 
-        raw = await loop.run_in_executor(self._connector.executor(), _copy)
-        if raw is None:
-            raise RuntimeError(f"Failed to fetch candles for {symbol} timeframe {timeframe}: {mt5.last_error()}")
-
-        candles: List[MarketCandle] = []
-        for r in raw:
-            t = datetime.fromtimestamp(int(r[0]), tz=timezone.utc)
+        candles = []
+        for r in raw_tuples:
             candles.append(MarketCandle(
-                time=t,
+                time=datetime.fromtimestamp(int(r[0]), tz=timezone.utc),
                 open=float(r[1]),
                 high=float(r[2]),
                 low=float(r[3]),
                 close=float(r[4]),
                 tick_volume=int(r[5]),
-                spread=int(r[6]) if len(r) > 6 else None
+                spread=int(r[6])
             ))
         return candles
 
     async def get_account_state(self) -> AccountState:
-        if mt5 is None:
-            raise RuntimeError("MetaTrader5 package not installed or not available.")
-
-        loop = asyncio.get_running_loop()
-        raw = await loop.run_in_executor(self._connector.executor(), mt5.account_info)
-
+        """Fetches the current account state."""
+        raw = await self._run_in_executor(mt5.account_info)
         if raw is None:
-            raise RuntimeError(f"Failed to fetch account information from MT5: {mt5.last_error()}")
+            raise RuntimeError("Failed to fetch account information from MT5.")
 
         return AccountState(
             login=int(raw.login),
             balance=float(raw.balance),
             equity=float(raw.equity),
             free_margin=float(getattr(raw, "margin_free", 0.0)),
-            margin_level=float(getattr(raw, "margin_level", 0.0)) if getattr(raw, "margin_level", None) is not None else None,
-            account_currency=str(getattr(raw, "currency", "USD"))
+            margin_level=float(getattr(raw, "margin_level", 0.0)) or None,
+            currency=str(getattr(raw, "currency", "USD"))
         )
 
     # --- NEW METHOD FOR REVISION 3 ---
     async def get_open_positions(self) -> List[PositionInfo]:
-        """
-        Fetches and maps all open positions.
-        """
-        if mt5 is None:
-            raise RuntimeError("MetaTrader5 package not installed or not available.")
-
-        loop = asyncio.get_running_loop()
-
-        def _get_pos():
-            return mt5.positions_get() # Get all positions
-
-        raw_positions = await loop.run_in_executor(self._connector.executor(), _get_pos)
-
+        """Fetches all currently open positions."""
+        raw_positions = await self._run_in_executor(mt5.positions_get)
         if raw_positions is None:
-            logger.warning(f"Could not fetch positions: {mt5.last_error()}")
+            logger.warning("mt5.positions_get() returned None.")
             return []
 
-        positions: List[PositionInfo] = []
+        positions = []
         for pos in raw_positions:
             try:
-                # 0 = Buy, 1 = Sell
-                pos_type = "buy" if getattr(pos, "type", 0) == 0 else "sell"
-
-                # Get live price for profit calculation
-                symbol = getattr(pos, "symbol", "")
-                tick = await loop.run_in_executor(self._connector.executor(), lambda s=symbol: mt5.symbol_info_tick(s))
-
-                current_price = 0.0
-                if tick:
-                    current_price = tick.ask if pos_type == "sell" else tick.bid # Price to close
-
                 positions.append(PositionInfo(
-                    ticket=int(getattr(pos, "ticket", 0)),
-                    symbol=symbol,
-                    type=pos_type,
-                    volume=float(getattr(pos, "volume", 0.0)),
-                    open_price=float(getattr(pos, "price_open", 0.0)),
-                    current_price=float(current_price),
-                    stop_loss=float(getattr(pos, "sl", 0.0)),
-                    take_profit=float(getattr(pos, "tp", 0.0)),
+                    ticket=int(pos.ticket),
+                    symbol=str(pos.symbol),
+                    type=int(pos.type),
+                    volume=float(pos.volume),
+                    open_price=float(pos.price_open),
+                    open_time=datetime.fromtimestamp(int(pos.time), tz=timezone.utc),
                     profit=float(getattr(pos, "profit", 0.0)),
                     swap=float(getattr(pos, "swap", 0.0)),
                     comment=str(getattr(pos, "comment", "")),
-                    open_time=datetime.fromtimestamp(int(getattr(pos, "time", 0)), tz=timezone.utc),
+                    current_price=float(getattr(pos, "price_current", 0.0)),
+                    stop_loss=float(getattr(pos, "sl", 0.0)),
+                    take_profit=float(getattr(pos, "tp", 0.0))
                 ))
             except Exception as e:
-                logger.error(f"Error mapping position {getattr(pos, 'ticket', 'N/A')}: {e}")
+                logger.exception(f"Error parsing position {getattr(pos, 'ticket', 'N/A')}: {e}")
 
         return positions
+
+    async def get_historical_trade(self, ticket: int) -> Optional[PositionHistoryInfo]:
+        """
+        Fetches the deal history for a specific position ticket
+        to find its closing details.
+
+        Note: This assumes the 'ticket' is the position ID. MT5 deals
+        are linked by 'position_id'.
+        """
+        try:
+            # We fetch the last 10 days of history. This should be enough.
+            from_date = datetime.now(timezone.utc) - pd.Timedelta(days=10)
+            to_date = datetime.now(timezone.utc) + pd.Timedelta(days=1)
+
+            # Fetch deals based on the position_id (which is the ticket)
+            deals = await self._run_in_executor(
+                mt5.history_deals_get,
+                from_date,
+                to_date
+            )
+
+            if deals is None:
+                logger.warning(f"Could not fetch deal history for ticket {ticket}")
+                return None
+
+            # Find deals related to this position
+            # A position is formed by one or more "in" deals and "out" deals.
+            # We need to find the "out" deal that closed this position.
+
+            related_deals = [d for d in deals if d.position_id == ticket]
+
+            if not related_deals:
+                logger.warning(f"No deals found for position_id {ticket} in history.")
+                return None
+
+            # Find the "in" deal (open) and "out" deal (close)
+            # entry_type 0 = DEAL_ENTRY_IN (open)
+            # entry_type 1 = DEAL_ENTRY_OUT (close)
+
+            open_deal = next((d for d in related_deals if d.entry == 0), None)
+            close_deal = next((d for d in related_deals if d.entry == 1), None)
+
+            if not open_deal or not close_deal:
+                # This could happen if the position is partially closed.
+                # For simplicity, we only handle full 1-in-1-out trades.
+                logger.warning(f"Could not find full open/close deals for {ticket}.")
+                return None
+
+            return PositionHistoryInfo(
+                ticket=ticket,
+                symbol=str(close_deal.symbol),
+                type=int(open_deal.type),  # 0=BUY, 1=SELL
+                volume=float(close_deal.volume),
+                open_price=float(open_deal.price),
+                close_price=float(close_deal.price),
+                open_time=datetime.fromtimestamp(int(open_deal.time), tz=timezone.utc),
+                close_time=datetime.fromtimestamp(int(close_deal.time), tz=timezone.utc),
+                profit=float(close_deal.profit),
+                swap=float(close_deal.swap),
+                comment=str(close_deal.comment)
+            )
+
+        except Exception as e:
+            logger.exception(f"Error fetching history for ticket {ticket}: {e}")
+            return None
 
     async def get_tick(self, symbol: str) -> Optional[TickQuote]:
         """
@@ -435,38 +483,80 @@ class MT5MarketDataRepository(IMarketDataRepository):
 
 class MT5TradeExecutionService(ITradeExecutionService):
     """
-    Trade execution service that encapsulates order placing and closing logic.
+    Concrete implementation for trade execution.
     """
-    def __init__(self, connector: MT5Connector, default_deviation: int = 20):
-        if not isinstance(connector, MT5Connector):
-             raise TypeError("Expected MT5Connector instance")
-        self._connector = connector
-        self._deviation = default_deviation  # max slippage in points
 
-    async def _get_live_price_and_min_volume(self, symbol: str, action: str) -> Tuple[float, float, float]:
-        """Helper to get current price, min volume, and volume step."""
+    def __init__(self,
+                 connector: MT5Connector,
+                 repo: IMarketDataRepository,
+                 default_deviation: int = 100):
         if mt5 is None:
-            raise RuntimeError("MetaTrader5 package not installed or not available.")
+            raise ImportError("MetaTrader5 package not installed.")
+        self._connector = connector
+        self._repo = repo
+        self._deviation = default_deviation  # max slippage in points
+        self._executor = self._connector.executor()
 
+    async def _run_in_executor(self, blocking_func, *args, **kwargs):
+        """Helper to run a blocking function in the connector's thread pool."""
         loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: blocking_func(*args, **kwargs)
+        )
 
-        # Use symbol_info to get min volume
-        si = await loop.run_in_executor(self._connector.executor(), lambda: mt5.symbol_info(symbol))
-        if si is None:
-            raise ValueError(f"Symbol not found: {symbol}")
+    async def _prepare_order_request(self,
+                                     symbol: str,
+                                     action: str,
+                                     lot: float,
+                                     stop_loss: Optional[float],
+                                     take_profit: Optional[float],
+                                     comment: Optional[str]) -> Dict[str, Any]:
+        """Builds the MT5 order request dictionary."""
 
-        volume_min = getattr(si, "volume_min", 0.01)
-        volume_step = getattr(si, "volume_step", 0.01)
+        if action not in ("buy", "sell"):
+            raise ValueError("action must be 'buy' or 'sell'")
 
-        # Use symbol_info_tick to get live price
-        info = await loop.run_in_executor(self._connector.executor(), lambda: mt5.symbol_info_tick(symbol))
-        if info is None:
-            # Fallback to symbol_info price if tick fails
-            price = si.ask if action == "buy" else si.bid
-        else:
-            price = info.ask if action == "buy" else info.bid
+        # Fetch live price
+        tick = await self._run_in_executor(mt5.symbol_info_tick, symbol)
+        if tick is None:
+            raise ValueError(f"Could not fetch tick data for {symbol}")
 
-        return float(price), float(volume_min), float(volume_step)
+        price = tick.ask if action == "buy" else tick.bid
+        order_type = mt5.ORDER_TYPE_BUY if action == "buy" else mt5.ORDER_TYPE_SELL
+
+        # Fetch symbol info for validation
+        info = await self._repo.get_symbol_info(symbol)
+
+        # 1. Round Lot Size
+        lot = round_to_step(lot, info.volume_step)
+
+        # 2. Validate Lot Size
+        if lot < info.volume_min:
+            logger.warning(f"Lot size {lot} < min {info.volume_min}. Adjusting to min.")
+            lot = info.volume_min
+        if lot > info.volume_max:
+            logger.warning(f"Lot size {lot} > max {info.volume_max}. Adjusting to max.")
+            lot = info.volume_max
+
+        # 3. Normalize SL/TP
+        sl = round(stop_loss, info.digits) if stop_loss is not None else 0.0
+        tp = round(take_profit, info.digits) if take_profit is not None else 0.0
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": float(lot),
+            "type": order_type,
+            "price": float(price),
+            "sl": sl,
+            "tp": tp,
+            "deviation": int(self._deviation),
+            "magic": 123456,  # Agent's magic number
+            "comment": self.safe_comment(comment) or "auto-agent",
+            "type_filling": mt5.ORDER_FILLING_IOC
+        }
+        return request
 
     async def place_market_order(self,
                                  symbol: str,
@@ -475,125 +565,98 @@ class MT5TradeExecutionService(ITradeExecutionService):
                                  stop_loss: Optional[float],
                                  take_profit: Optional[float],
                                  comment: Optional[str] = None) -> OrderResult:
-        if mt5 is None:
-            return OrderResult(success=False, ticket=None, comment="MetaTrader5 package not installed.", raw=None)
-
-        loop = asyncio.get_running_loop()
-
+        """Places a new market order."""
         try:
-            price, volume_min, volume_step = await self._get_live_price_and_min_volume(symbol, action)
+            request = await self._prepare_order_request(
+                symbol, action, lot, stop_loss, take_profit, comment
+            )
 
-            # --- VALIDATION ---
-            if lot < volume_min:
-                return OrderResult(success=False, ticket=None, comment=f"Lot size {lot} is below minimum {volume_min}", raw=None)
+            logger.info(f"Sending order request: {request}")
+            result = await self._run_in_executor(lambda: mt5.order_send(**request))
 
-            # Check if lot size adheres to volume step
-            if (Decimal(str(lot)) * 10**8) % (Decimal(str(volume_step)) * 10**8) != 0:
-                 return OrderResult(success=False, ticket=None, comment=f"Lot size {lot} has invalid step. Must be multiple of {volume_step}", raw=None)
+            return self._parse_result(result)
 
-            order_type = mt5.ORDER_TYPE_BUY if action == "buy" else mt5.ORDER_TYPE_SELL
+        except Exception as exc:
+            logger.exception(f"Error in place_market_order: {exc}")
+            return OrderResult(success=False, ticket=None, comment=str(exc), raw=None)
 
-            # Clean SL/TP
-            sl_price = float(stop_loss) if stop_loss is not None and stop_loss > 0 else 0.0
-            tp_price = float(take_profit) if take_profit is not None and take_profit > 0 else 0.0
+    async def close_position(self,
+                             position: PositionInfo,  # <-- MODIFIED
+                             comment: Optional[str] = None) -> OrderResult:  # <-- MODIFIED
+        """Closes an existing open position."""
+        try:
+            symbol = position.symbol
+            volume = position.volume
+            ticket = position.ticket
 
+            # Determine opposite order type
+            order_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+
+            # Get live price
+            tick = await self._run_in_executor(mt5.symbol_info_tick, symbol)
+            if tick is None:
+                raise ValueError(f"Could not fetch tick data for {symbol}")
+
+            price = tick.bid if order_type == mt5.ORDER_TYPE_SELL else tick.ask
+            logger.info(comment)
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
                 "symbol": symbol,
-                "volume": float(lot), # Already validated and rounded by calculate_lot_size
+                "volume": float(volume),
                 "type": order_type,
-                "price": price,
-                "sl": sl_price,
-                "tp": tp_price,
+                "position": int(ticket),  # Specify the position ticket to close
+                "price": float(price),
                 "deviation": int(self._deviation),
-                "magic": 123456,
-                "comment": comment or "auto-trade",
+                "magic": 123456,  # Agent's magic number
+                "comment":  "auto-agent-close",
                 "type_filling": mt5.ORDER_FILLING_FOK, # FOK is standard
             }
-        except Exception as e:
-            logger.error(f"Error preparing order request: {e}")
-            return OrderResult(success=False, ticket=None, comment=f"Error preparing order: {e}", raw=None)
 
-        def _send():
-            return mt5.order_send(request)
+            logger.info(f"Sending close request: {request}")
+            result = await self._run_in_executor(lambda: mt5.order_send(**request))
 
-        result = await loop.run_in_executor(self._connector.executor(), _send)
-
-        if result is None:
-            return OrderResult(success=False, ticket=None, comment=f"MT5 returned None. LastError: {mt5.last_error()}", raw=None)
-
-        try:
-            retcode = getattr(result, "retcode", None)
-            logger.info(f"Order send result: {result}")
-
-            # 10009 is TRADE_RETCODE_DONE
-            if retcode is not None and int(retcode) == 10009:
-                ticket = getattr(result, "order", None)
-                return OrderResult(success=True, ticket=int(ticket) if ticket is not None else None, comment="Order placed", raw=result._asdict())
-
-            # If there is an error code, capture it
-            comment = f"Order failed: retcode={retcode}, comment={getattr(result, 'comment', 'N/A')}"
-            logger.warning(comment)
-            return OrderResult(success=False, ticket=None, comment=comment, raw=result._asdict())
+            return self._parse_result(result)
 
         except Exception as exc:
-            logger.exception("Error interpreting order result")
-            return OrderResult(success=False, ticket=None, comment=str(exc), raw=str(result))
+            logger.exception(f"Error in close_position: {exc}")
+            return OrderResult(success=False, ticket=None, comment=str(exc), raw=None)
 
-    async def close_position(self, ticket: int) -> OrderResult:
-        if mt5 is None:
-            return OrderResult(success=False, ticket=None, comment="MetaTrader5 package not installed.", raw=None)
-
-        loop = asyncio.get_running_loop()
-
-        def _get_pos():
-            return mt5.positions_get(ticket=ticket)
-
-        pos = await loop.run_in_executor(self._connector.executor(), _get_pos)
-
-        if not pos:
-            return OrderResult(success=False, ticket=None, comment=f"No position found with ticket {ticket}", raw=None)
-
-        position = pos[0]
-        symbol = position.symbol
-        volume = position.volume
-
-        # close type depends on position direction
-        order_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-
-        # get current price
-        try:
-            price, _, _ = await self._get_live_price_and_min_volume(symbol, "sell" if order_type == mt5.ORDER_TYPE_SELL else "buy")
-        except Exception as e:
-            return OrderResult(success=False, ticket=None, comment=f"Failed to get closing price: {e}", raw=None)
-
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": float(volume),
-            "type": order_type,
-            "position": int(position.ticket),
-            "price": price,
-            "deviation": int(self._deviation),
-            "magic": 123456,
-            "comment": "close-position",
-            "type_filling": mt5.ORDER_FILLING_FOK,
-        }
-
-        def _send():
-            return mt5.order_send(request)
-
-        result = await loop.run_in_executor(self._connector.executor(), _send)
-
+    def _parse_result(self, result: Any) -> OrderResult:
+        """Helper to parse the complex result from mt5.order_send."""
         if result is None:
-            return OrderResult(success=False, ticket=None, comment=f"MT5 returned None. LastError: {mt5.last_error()}", raw=None)
+            logger.info(mt5.last_error())
+            return OrderResult(success=False, ticket=None, comment="mt5.order_send returned None", raw=None)
 
-        retcode = getattr(result, "retcode", None)
-        if retcode is not None and int(retcode) == 10009:
-            return OrderResult(success=True, ticket=int(getattr(result, "order", None)), comment="Position closed", raw=result._asdict())
+        # Convert namedtuple to dict if necessary
+        raw_dict = result._asdict() if hasattr(result, "_asdict") else dict(result)
 
-        return OrderResult(success=False, ticket=None, comment=f"Close failed: retcode={retcode}", raw=result._asdict())
+        retcode = getattr(result, "retcode", -1)
+        comment = getattr(result, "comment", "Unknown error")
 
+        # 10009 is "Request executed"
+        # 10008 is "Request processing" (also good)
+        if retcode in (10009, 10008):
+            ticket = int(getattr(result, "order", 0))
+            if ticket > 0:
+                logger.info(f"Order success, retcode: {retcode}, ticket: {ticket}")
+                return OrderResult(success=True, ticket=ticket, comment=comment, raw=raw_dict)
+
+        logger.error(f"Order failed, retcode: {retcode}, comment: {comment}, raw: {raw_dict}")
+        return OrderResult(success=False, ticket=None, comment=f"retcode: {retcode} - {comment}", raw=raw_dict)
+
+    def safe_comment(self, comment: str) -> str:
+        import re
+        """Ensure MT5 comment field is ASCII-only and <=31 bytes."""
+        if not comment:
+            return "auto-agent"
+        # Convert to str in case it’s not
+        comment = str(comment)
+        # Remove non-printable/non-ASCII characters
+        comment = re.sub(r"[^\x20-\x7E]", "", comment)
+        # Truncate to max 31 bytes (safe for UTF-8)
+        while len(comment.encode("ascii", "ignore")) > 31:
+            comment = comment[:-1]
+        return comment
 # --- NEW SERVICE FOR REVISION 3 ---
 
 class PandasTAIndicatorService(ITechnicalIndicatorService):
@@ -682,6 +745,41 @@ class PandasTAIndicatorService(ITechnicalIndicatorService):
         )
 
 # -------------------------- Utilities & Helpers --------------------------------
+def round_to_step(value: float, step: float) -> float:
+    """
+    Rounds a value to the nearest valid step size.
+    e.g., round_to_step(0.123, 0.01) -> 0.12
+    e.g., round_to_step(0.128, 0.01) -> 0.13
+    e.g., round_to_step(0.12, 0.05) -> 0.10
+    e.g., round_to_step(0.14, 0.05) -> 0.15
+    """
+    if step <= 0:
+        return value
+
+    # Use math.fsum for precision
+    # (value / step)
+    # round(...)
+    # ... * step
+
+    # We must account for floating point inaccuracies
+    # e.g., 0.01 -> "0.01" -> 2 decimal places
+
+    try:
+        # Get number of decimal places from the step
+        step_str = str(step)
+        if 'e-' in step_str:
+            decimals = int(step_str.split('e-')[-1])
+        elif '.' in step_str:
+            decimals = len(step_str.split('.')[-1])
+        else:
+            decimals = 0
+
+        return round(round(value / step) * step, decimals)
+
+    except Exception:
+        # Fallback for complex steps
+        return round(value / step) * step
+
 
 def calculate_lot_size(account_balance: float,
                          risk_percent: float,
@@ -872,12 +970,14 @@ __all__ = [
     "OrderResult",
     "PositionInfo",
     "TechnicalIndicators",
+    "TickQuote",
     # Protocols
     "IMarketDataRepository",
     "ITradeExecutionService",
     "ITechnicalIndicatorService",
     # Utilities
     "calculate_lot_size",
+    "round_to_step"
 ]
 
 # If run as script, demonstrate module usage

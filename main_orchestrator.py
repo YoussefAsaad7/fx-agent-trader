@@ -31,6 +31,7 @@ from llm_client import (
     QwenClient
 )
 from engine import ForexAgentEngine
+from trade_reconciler import TradeReconciler, ITradeReconciler
 
 # Setup basic logging
 logging.basicConfig(
@@ -49,10 +50,12 @@ class TradingScheduler:
 
     def __init__(self,
                  engine: ForexAgentEngine,
-                 config: Config):
+                 config: Config,
+                 reconciler):
         self._engine = engine
         self._config = config
         self._task: Optional[asyncio.Task] = None
+        self._reconciler: ITradeReconciler = reconciler
         self._running = False
 
     async def start(self):
@@ -68,6 +71,11 @@ class TradingScheduler:
         while self._running:
             try:
                 logger.info("--- Starting new decision cycle ---")
+                # 0. Reconcile trades first!
+                # This ensures our view of the world is accurate *before*
+                # we fetch metrics or make decisions.
+                reconciled_count = await self._reconciler.reconcile_trades()
+                logger.info(f"Reconciliation found and closed {reconciled_count} ghost trades.")
 
                 # 1. Decide
                 full_decision = await self._engine.decide(self._config.watch_list)
@@ -109,7 +117,7 @@ class TradingScheduler:
                 logger.info("TradingScheduler stopped.")
 
 
-async def setup_dependencies(cfg: Config) -> Tuple[ForexAgentEngine, MT5Connector, ILLMClient]:
+async def setup_dependencies(cfg: Config) -> Tuple[ForexAgentEngine, MT5Connector, ILLMClient, ITradeReconciler]:
     """
     Initializes all services and wires them together (Dependency Injection).
     """
@@ -125,12 +133,15 @@ async def setup_dependencies(cfg: Config) -> Tuple[ForexAgentEngine, MT5Connecto
     repo = MT5MarketDataRepository(connector)
     indicator_svc = PandasTAIndicatorService()
     builder = AgentContextBuilder(repo, indicator_svc)
-    executor = MT5TradeExecutionService(connector)
+    executor = MT5TradeExecutionService(connector, repo)
 
     # 3. Persistence
     persistence = SQLiteTradeRepository(db_path="trade_history.db")
-    await persistence.initialize()  # Create tables
 
+    reconciler = TradeReconciler(
+        trade_repo=persistence,
+        market_repo=repo
+    )
     # 4. LLM Client (Strategy Pattern)
     llm_client: ILLMClient
     if cfg.llm_provider == "deepseek":
@@ -160,7 +171,7 @@ async def setup_dependencies(cfg: Config) -> Tuple[ForexAgentEngine, MT5Connecto
     )
 
     logger.info("All dependencies initialized successfully.")
-    return engine, connector, llm_client
+    return engine, connector, llm_client, reconciler
 
 
 async def main():
@@ -174,10 +185,10 @@ async def main():
         cfg = load_config()
 
         # 2. Setup
-        engine, connector, llm_client = await setup_dependencies(cfg)
+        engine, connector, llm_client, reconciler  = await setup_dependencies(cfg)
 
         # 3. Run
-        scheduler = TradingScheduler(engine, cfg)
+        scheduler = TradingScheduler(engine, cfg, reconciler)
         await scheduler.start()
 
     except FileNotFoundError as e:

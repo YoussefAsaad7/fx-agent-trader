@@ -1,14 +1,7 @@
 """
 engine.py
-ForexAgentEngine: Business process orchestrator.
-
-- Uses AgentContextBuilder to build the full market context.
-- Uses Persistence module to get historical performance (Sharpe Ratio).
-- Builds the System and User prompts for the LLM.
-- Calls the LLM (ILLMClient).
-- Parses and validates the LLM's response (CoT and JSON decisions).
-- (Optional) Executes decisions via MT5TradeExecutionService.
-- (Optional) Stores closed trade results into the Persistence module.
+The core Trading Agent Engine.
+Connects all services to make decisions.
 """
 
 import asyncio
@@ -16,19 +9,15 @@ import logging
 import json
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Protocol, Dict
+from typing import List, Optional
 from datetime import datetime
 
 # Import all our custom modules
 from mt5 import (
     IMarketDataRepository,
     ITradeExecutionService,
-    SymbolInfo,
-    AccountState,
     PositionInfo,
-    calculate_lot_size,
-    OrderResult,
-    TechnicalIndicators, MarketCandle, ITechnicalIndicatorService, TickQuote
+    calculate_lot_size
 )
 from agent_context_builder import (
     AgentContextBuilder,
@@ -37,8 +26,7 @@ from agent_context_builder import (
 )
 from persistence import (
     ITradeRepository,
-    PerformanceMetrics,
-    ClosedTrade, SQLiteTradeRepository
+    PerformanceMetrics
 )
 from llm_client import ILLMClient
 logger = logging.getLogger(__name__)
@@ -145,7 +133,7 @@ class ForexAgentEngine:
         # 1. Account State
         acc = context.account_state
         lines.append(f"## Account State")
-        lines.append(f"Balance: {acc.balance:.2f} {acc.account_currency}")
+        lines.append(f"Balance: {acc.balance:.2f} {acc.currency}")
         lines.append(f"Equity: {acc.equity:.2f}")
         lines.append(f"Free Margin: {acc.free_margin:.2f}")
         lines.append("---")
@@ -164,7 +152,8 @@ class ForexAgentEngine:
         lines.append("## Open Positions")
         if context.open_positions:
             for pos in context.open_positions:
-                lines.append(f"- {pos.symbol} {pos.type.upper()} {pos.volume} lots")
+                pos_type = "BUY" if pos.type == 0 else "SELL"
+                lines.append(f"- {pos.symbol} {pos_type} {pos.volume} lots")
                 lines.append(f"  Entry: {pos.open_price:.5f}, Current: {pos.current_price:.5f}")
                 lines.append(f"  Profit: {pos.profit:.2f}, Swap: {pos.swap:.2f}")
                 lines.append(f"  SL: {pos.stop_loss:.5f}, TP: {pos.take_profit:.5f} (Ticket: {pos.ticket})")
@@ -178,7 +167,7 @@ class ForexAgentEngine:
             info = sym_context.symbol_info
             lines.append(f"\n### Symbol: {symbol}")
             lines.append(f"Spread: {info.spread} points | Swap: {info.swap_long} (L) / {info.swap_short} (S)")
-            lines.append(f"Tick Value: {info.trade_tick_value} {acc.account_currency} | Point: {info.point}")
+            lines.append(f"Tick Value: {info.trade_tick_value} {acc.currency} | Point: {info.point}")
 
             for tf_data in sym_context.market_data:
                 lines.append(f"\n  Timeframe: {tf_data.timeframe} (Last 10 data points)")
@@ -462,7 +451,18 @@ class ForexAgentEngine:
                     comment=f"Agent v1 | {decision.confidence:.0%}"
                 )
                 logger.info(f"Execution result: {result}")
-
+                if result.success and result.ticket:
+                    # We must wait for the position to appear in MT5
+                    await asyncio.sleep(2.0)  # Wait 2s for broker propagation
+                    pos = await self._find_position_by_ticket(result.ticket, context)
+                    if pos:
+                        await self._persistence.store_new_open_trade(
+                            position=pos,
+                            reasoning="", #TODO replace with acutal reasoning
+                            confidence=decision.confidence
+                        )
+                    else:
+                        logger.error(f"Could not find newly opened position {result.ticket} to store in DB!")
             elif action == "close":
                 logger.info(f"--- EXECUTING CLOSE {decision.symbol} ---")
                 # Find open position for this symbol
@@ -476,27 +476,27 @@ class ForexAgentEngine:
                     logger.warning(f"Wanted to close {decision.symbol}, but no open position was found.")
                     return
 
-                result = await self._executor.close_position(pos_to_close.ticket)
+                result = await self._executor.close_position(pos_to_close, comment=decision.invalidation_condition)
                 logger.info(f"Close result: {result}")
-
-                # Critical: If successful, log to persistence
                 if result.success:
-                    # We need the open time. pos_to_close doesn't have it, PositionInfo needs modification
-                    # To fix this, mt5_module.py's get_open_positions should also fetch `pos.time`
-                    # Assuming we can get open_time...
-                    open_time = pos_to_close.open_time
+                    # The trade is closed. We must wait for the broker
+                    # to process the closure before fetching history.
+                    await asyncio.sleep(2.0)  # Wait 2s
 
-                    closed_trade = ClosedTrade(
-                        id=None,
-                        symbol=pos_to_close.symbol,
-                        profit=pos_to_close.profit,  # MT5 PositionInfo has P/L
-                        open_time=open_time,
-                        close_time=datetime.utcnow(),
-                        volume=pos_to_close.volume,
-                        llm_reasoning=f"Close decision: {decision.invalidation_condition}",
-                        llm_confidence=decision.confidence or 0.5
-                    )
-                    await self._persistence.store_trade(closed_trade)
+                    # Fetch the historical trade data
+                    closed_trade_history = await self._market_repo.get_historical_trade(pos_to_close.ticket)
+
+                    if closed_trade_history:
+                        await self._persistence.update_trade_as_closed(
+                            ticket=pos_to_close.ticket,
+                            close_time=closed_trade_history.close_time,
+                            close_price=closed_trade_history.close_price,
+                            profit=closed_trade_history.profit,
+                            swap=closed_trade_history.swap
+                        )
+                        logger.info(f"Successfully closed and logged trade {pos_to_close.ticket}")
+                    else:
+                        logger.error(f"Closed trade {pos_to_close.ticket} but could not fetch its history to log.")
 
             elif action == "hold":
                 logger.info(f"--- EXECUTING HOLD {decision.symbol} ---")
@@ -504,127 +504,21 @@ class ForexAgentEngine:
         except Exception as e:
             logger.exception(f"Execution failed for {action} {decision.symbol}")
 
-
-# -------------------------- Mocking and Example Usage ----------------------------------
-
-class MockLLMClient(ILLMClient):
-    """Mock LLM client for testing the engine."""
-
-    async def call(self, system: str, user: str) -> str:
-        logger.info("--- MOCK LLM CALL (System) ---")
-        logger.info(system[:200] + "...")
-        logger.info("--- MOCK LLM CALL (User) ---")
-        logger.info(user[:500] + "...")
-
-        # Mock an LLM response
-        mock_json = """
-        [
-            {
-                "symbol": "EURUSD",
-                "action": "buy_to_enter",
-                "profit_target": 1.10500,
-                "stop_loss": 1.09500,
-                "invalidation_condition": "H1 close below 1.09500",
-                "confidence": 0.75,
-                "lot_size": 0.1
-            },
-            {
-                "symbol": "USDJPY",
-                "action": "hold",
-                "invalidation_condition": "Waiting for breakout",
-                "confidence": 0.5
-            }
-        ]
+    async def _find_position_by_ticket(self, ticket: int, context: AgentFullContext) -> Optional[PositionInfo]:
         """
-        return f"<reasoning>\nAnalyzed EURUSD and USDJPY.\nEURUSD looks bullish, RSI just bounced from oversold.\nUSDJPY is consolidating, deciding to hold.\n</reasoning>\n```json\n{mock_json}\n```"
+        Finds a position by its ticket.
+        This is tricky because the context is *stale*. We must re-fetch.
+        """
+        # Re-fetch open positions
+        open_positions = await self._market_repo.get_open_positions()
 
+        for pos in open_positions:
+            if pos.ticket == ticket:
+                return pos
 
-async def main():
-    """Demonstrates the full usage of the engine."""
+        # It might be in the original context if we're fast enough
+        for pos in context.open_positions:
+            if pos.ticket == ticket:
+                return pos
 
-    # This requires a running MT5 terminal
-    # and requires `pip install pandas pandas-ta numpy`
-
-    logger.info("--- Starting Full Engine Cycle (Mock) ---")
-
-    # 1. Mock dependencies
-    # (In a real scenario, these would be the real services)
-    mock_llm = MockLLMClient()
-
-    # To make the example run, we need to mock MT5 and the Builder
-    # In a real scenario, we would init them like in agent_context_builder.py
-    class MockRepo(IMarketDataRepository):
-        async def get_symbol_info(self, symbol: str) -> SymbolInfo:
-            return SymbolInfo('EURUSD', 0.00001, 5, 10, 100000, 0.01, 0.01, 1.0, -1.0, -0.5, 'EUR', 'USD', 'EUR')
-
-        async def get_last_candles(self, s, t, c) -> List: return [
-            MarketCandle(datetime.utcnow(), 1.1, 1.1, 1.1, 1.1, 100)]
-
-        async def get_account_state(self) -> AccountState:
-            return AccountState(123, 10000.0, 10000.0, 10000.0, 100.0, 'USD')
-
-        async def get_open_positions(self) -> List: return []
-
-        async def get_tick(self, symbol: str) -> Optional[TickQuote]:
-            return TickQuote("EURUSD", 1.3455, 1.3456, 1111112333)
-
-    class MockIndicatorSvc(ITechnicalIndicatorService):
-        async def calculate_indicators(self, *args, **kwargs):
-            return TechnicalIndicators()  # Return empty indicators
-
-    class MockExecutor(ITradeExecutionService):
-        async def place_market_order(self, *args, **kwargs):
-            logger.info(f"[MockExecutor] PLACE ORDER: {kwargs}")
-            return OrderResult(True, 12345, "Mock order placed", {})
-
-        async def close_position(self, *args, **kwargs):
-            logger.info(f"[MockExecutor] CLOSE POSITION: {kwargs}")
-            return OrderResult(True, 12346, "Mock position closed", {})
-
-    # 2. Set up real dependencies
-    repo = MockRepo()  # In real scenario: MT5MarketDataRepository(connector)
-    indicator_svc = MockIndicatorSvc()  # In real scenario: PandasTAIndicatorService()
-    builder = AgentContextBuilder(repo, indicator_svc)
-    executor = MockExecutor()  # In real scenario: MT5TradeExecutionService(connector)
-    persistence = SQLiteTradeRepository(db_path="ex.db")
-    await persistence.initialize()
-
-    # 3. Define our desired data
-    watch_list = [
-        SymbolWatchConfig(symbol="EURUSD", timeframes=[]),
-        SymbolWatchConfig(symbol="USDJPY", timeframes=[]),
-    ]
-
-    # 4. Initialize the engine
-    engine = ForexAgentEngine(
-        context_builder=builder,
-        trade_executor=executor,
-        persistence_repo=persistence,
-        llm_client=mock_llm,
-        market_repo=repo,  # Pass in the repo
-        system_prompt_template="[Your long system prompt goes here]\nYou will receive your Sharpe Ratio at each invocation:"
-    )
-
-    # 5. Execute a decision cycle
-    full_decision = await engine.decide(watch_list)
-
-    logger.info(f"\n--- Decision Cycle Complete ---")
-    logger.info(f"CoT: {full_decision.cot_reasoning}")
-
-    # 6. Execute decisions
-    for decision in full_decision.decisions:
-        logger.info(f"Validated decision: {decision}")
-        if not decision._validation_error:
-            # Mock execution
-            await engine.execute(decision, full_decision.context)
-            logger.info(f"Would execute: {decision.action} {decision.symbol}")
-        else:
-            logger.error(f"Decision invalid: {decision._validation_error}")
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    # Note: In a real scenario, you'd need a running asyncio loop
-    asyncio.run(main())
-    logger.info("To run the engine.py example, uncomment main() and ensure MT5/pandas are installed.")
-
+        return None
