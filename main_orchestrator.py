@@ -94,7 +94,7 @@ class TradingScheduler:
                             f"Decision VALID: {decision.symbol} {decision.action} (Lot: {decision._calculated_lot_size})")
 
                         if not self._config.dry_run:
-                            await self._engine.execute(decision, full_decision.context)
+                            await self._engine.execute(decision, full_decision.context, full_decision.cot_reasoning)
                         else:
                             logger.info(f"[DRY RUN] Would execute {decision.action} for {decision.symbol}")
 

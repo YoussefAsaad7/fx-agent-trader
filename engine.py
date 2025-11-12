@@ -423,7 +423,7 @@ class ForexAgentEngine:
                 cot_reasoning=f"Engine failed: {e}", decisions=[]
             )
 
-    async def execute(self, decision: AgentDecision, context: AgentFullContext):
+    async def execute(self, decision: AgentDecision, context: AgentFullContext, reasoning: str):
         """
         Executes a single validated decision.
         """
@@ -458,7 +458,7 @@ class ForexAgentEngine:
                     if pos:
                         await self._persistence.store_new_open_trade(
                             position=pos,
-                            reasoning="", #TODO replace with acutal reasoning
+                            reasoning=reasoning,
                             confidence=decision.confidence
                         )
                     else:
