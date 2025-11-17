@@ -112,7 +112,7 @@ async def example_trade_logic(repo: IMarketDataRepository,
 
     # 5. --- Example: Open New Position ---
     # Simple signal: if RSI < 30, buy.
-    if indicators.rsi and indicators.rsi[-1] < 30:
+    if indicators.rsi and indicators.rsi[-1] < 30 or True:
         logger.info("Signal: RSI is oversold. Preparing BUY order.")
 
         # --- Risk Management ---

@@ -485,7 +485,11 @@ class MT5TradeExecutionService(ITradeExecutionService):
             ticket = int(getattr(result, "order", 0))
             if ticket == 0:
                 # Sometimes the ticket is in the request object
-                ticket = int(getattr(result, "request", {}).get("position", 0))
+                # FIX: result.request is an object (TradeRequest), not a dict.
+                # We must use getattr() to access its 'position' attribute.
+                request_obj = getattr(result, "request", None)
+                if request_obj:
+                    ticket = int(getattr(request_obj, "position", 0))
 
             logger.info(f"Order success, retcode: {retcode}, ticket: {ticket}, comment: {comment}")
             return OrderResult(success=True, ticket=ticket, comment=comment, raw=raw_dict)
