@@ -8,7 +8,7 @@ closed by Take Profit (TP) or Stop Loss (SL).
 import logging
 from typing import Protocol
 from persistence import ITradeRepository
-from mt5 import IMarketDataRepository
+from market import IMarketDataRepository
 
 logger = logging.getLogger(__name__)
 

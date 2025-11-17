@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 
 # Import all necessary components from the upgraded mt5_module
-from mt5 import (
+from market import (
     IMarketDataRepository,
     ITechnicalIndicatorService,
     AccountState,
