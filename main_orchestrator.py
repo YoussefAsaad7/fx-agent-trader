@@ -16,7 +16,7 @@ from typing import Optional, Tuple
 import os
 # Import all our custom modules
 from config import load_config, Config
-from mt5 import (
+from market import (
     MT5Connector,
     MT5MarketDataRepository,
     MT5TradeExecutionService,

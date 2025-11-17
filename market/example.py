@@ -24,9 +24,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Import from the new mt5 package ---
-# Notice all imports are from the top-level 'mt5' package
-from mt5 import (
+
+# --- Import from the new market package ---
+# Notice all imports are from the top-level 'market' package
+from market import (
     MT5Connector,
     MT5MarketDataRepository,
     MT5TradeExecutionService,
@@ -76,7 +77,7 @@ async def example_trade_logic(repo: IMarketDataRepository,
 
     # 4. --- Example: Manage Existing Positions ---
     if eurusd_positions:
-        pos = eurusd_positions[0]  # Manage the first found position
+        pos = eurusd_positions[0] # Manage the first found position
         logger.info(f"Managing existing position: {pos.ticket}, Vol={pos.volume}, Profit={pos.profit}")
 
         # --- NEW FEATURE 1: Update SL ---
@@ -102,22 +103,22 @@ async def example_trade_logic(repo: IMarketDataRepository,
         # Example: Set a new random TP
         current_tick = await repo.get_tick(EXAMPLE_SYMBOL)
         if current_tick:
-            new_tp = current_tick.ask + (random.randint(50, 100) * info.point)  # New 50-100 point TP
+            new_tp = current_tick.ask + (random.randint(50, 100) * info.point) # New 50-100 point TP
             new_tp = round(new_tp, info.digits)
             logger.info(f"Attempting to update TP for {pos.ticket} to {new_tp}")
             res_tp = await exec_svc.update_position_tp(pos.ticket, new_tp)
             logger.info(f"TP Update Result: {res_tp}")
 
-        return  # Don't open a new trade if we are managing one
+        return # Don't open a new trade if we are managing one
 
     # 5. --- Example: Open New Position ---
     # Simple signal: if RSI < 30, buy.
-    if indicators.rsi and indicators.rsi[-1] < 30 or True:
+    if indicators.rsi and indicators.rsi[-1] < 30:
         logger.info("Signal: RSI is oversold. Preparing BUY order.")
 
         # --- Risk Management ---
-        stop_loss_points = int(indicators.atr[-1] / info.point) * 2  # 2x ATR
-        if stop_loss_points == 0: stop_loss_points = 500  # Fallback
+        stop_loss_points = int(indicators.atr[-1] / info.point) * 2 # 2x ATR
+        if stop_loss_points == 0: stop_loss_points = 500 # Fallback
 
         current_tick = await repo.get_tick(EXAMPLE_SYMBOL)
         if not current_tick:
@@ -125,11 +126,11 @@ async def example_trade_logic(repo: IMarketDataRepository,
             return
 
         stop_loss_price = current_tick.ask - (stop_loss_points * info.point)
-        take_profit_price = current_tick.ask + (stop_loss_points * 2 * info.point)  # 2:1 R:R
+        take_profit_price = current_tick.ask + (stop_loss_points * 2 * info.point) # 2:1 R:R
 
         lot = calculate_lot_size(
             account_balance=account.balance,
-            risk_percent=0.01,  # 1% risk
+            risk_percent=0.01, # 1% risk
             stop_loss_pips=float(stop_loss_points),
             pip_value_per_lot=info.trade_tick_value,
             volume_step=info.volume_step

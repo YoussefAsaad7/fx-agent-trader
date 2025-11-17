@@ -13,7 +13,7 @@ import asyncio  # <-- NEW: Import asyncio
 from dataclasses import dataclass
 from typing import List, Optional, Protocol, Callable, Any
 from datetime import datetime
-from mt5 import PositionInfo  # <-- MODIFIED: Corrected import from mt5_module
+from market import PositionInfo
 
 logger = logging.getLogger(__name__)
 
