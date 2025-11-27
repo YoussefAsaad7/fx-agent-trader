@@ -10,7 +10,7 @@ These classes depend directly on the `MetaTrader5` library and the
 requests (e.g., `get_symbol_info`) into specific MT5 library calls
 and mapping the MT5 results back to the application's domain models.
 """
-
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import List, Optional, Any, Dict
@@ -34,6 +34,7 @@ from .domain import (
     OrderResult
 )
 from .utils import round_to_step, safe_comment
+from persistence import ITradeRepository
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +46,10 @@ class MT5MarketDataRepository(IMarketDataRepository):
     Concrete implementation that fetches market and account data from MT5.
     """
 
-    def __init__(self, connector: MT5Connector):
+    def __init__(self, connector: MT5Connector, repo: ITradeRepository):
         self.mt5 = connector.mt5
         self._connector = connector
+        self.repo = repo
 
     async def _run(self, blocking_func, *args, **kwargs):
         """Alias for the connector's executor runner."""
@@ -119,8 +121,13 @@ class MT5MarketDataRepository(IMarketDataRepository):
         )
 
     async def get_open_positions(self) -> List[PositionInfo]:
-        """Fetches all currently open positions."""
-        raw_positions = await self._run(self.mt5.positions_get)
+        """Fetches all currently open positions and enriches them with Peak PnL."""
+        # 1. Parallel Execution: Get MT5 positions AND DB States simultaneously
+        # This is highly efficient. We don't wait for one to finish before starting the other.
+        mt5_task = self._run(self.mt5.positions_get)
+        db_task = self.repo.sync_open_trade_states()
+
+        raw_positions, stored_peaks = await asyncio.gather(mt5_task, db_task)
         if raw_positions is None:
             logger.warning("mt5.positions_get() returned None.")
             return []
@@ -128,6 +135,26 @@ class MT5MarketDataRepository(IMarketDataRepository):
         positions = []
         for pos in raw_positions:
             try:
+                ticket = int(pos.ticket)
+                current_profit = float(getattr(pos, "profit", 0.0))
+
+                # 2. Determine the Peak
+                # If we have a stored peak, use it. Otherwise, default to current (start of tracking).
+                previous_peak = stored_peaks.get(ticket, current_profit)
+
+                # 3. Calculate High-Water Mark
+                # If current profit is higher than history, we have a new peak.
+                # Note: We handle the edge case where peak might be negative (recovering from loss).
+                real_peak = max(current_profit, previous_peak)
+
+                # 4. Conditional Write-Back (Optimization)
+                # Only hit the DB if we actually established a new high.
+                # We use a small buffer (e.g., 0.01) to avoid DB churn on micro-fluctuations if desired,
+                # strictly speaking strict inequality is fine for SQLite.
+                if real_peak > previous_peak:
+                    # Fire and forget: We don't need to await this strictly before proceeding,
+                    # but creating a task ensures it runs without blocking the loop.
+                    asyncio.create_task(self.repo.update_peak_profit(ticket, real_peak))
                 positions.append(PositionInfo(
                     ticket=int(pos.ticket),
                     symbol=str(pos.symbol),
@@ -140,12 +167,56 @@ class MT5MarketDataRepository(IMarketDataRepository):
                     comment=str(getattr(pos, "comment", "")),
                     current_price=float(getattr(pos, "price_current", 0.0)),
                     stop_loss=float(getattr(pos, "sl", 0.0)),
-                    take_profit=float(getattr(pos, "tp", 0.0))
+                    take_profit=float(getattr(pos, "tp", 0.0)),
+                    margin= await self.get_calculated_margin(str(pos.symbol), pos.type, pos.volume, pos.price_open),
+                    # Inject the calculated peak
+                    peak_profit=real_peak
                 ))
             except Exception as e:
                 logger.exception(f"Error parsing position {getattr(pos, 'ticket', 'N/A')}: {e}")
 
         return positions
+
+    async def get_calculated_margin(self, symbol: str, action: str, volume: float, price: float) -> Optional[float]:
+        """
+        Calculates the required margin for a specific order asynchronously.
+
+        Args:
+            symbol: The asset symbol (e.g. "EURUSD")
+            action: "buy" (0) or "sell" (1)
+            volume: Lot size
+            price: Open price (usually current Ask for Buy, Bid for Sell)
+
+        Returns:
+            float: The required margin in account currency, or None if failed.
+        """
+        # 1. Determine MT5 Order Type
+        # Handle strings ('buy', 'sell') or integers (0, 1)
+        action_lower = str(action).lower()
+        if action_lower in ("buy", "buy_to_enter", "0"):
+            mt5_type = self.mt5.ORDER_TYPE_BUY
+        elif action_lower in ("sell", "sell_to_enter", "1"):
+            mt5_type = self.mt5.ORDER_TYPE_SELL
+        else:
+            logger.error(f"Unknown action type for margin calc: {action}")
+            return None
+
+        # 2. Execute blocking call via _run
+        margin = await self._run(
+            self.mt5.order_calc_margin,
+            mt5_type,
+            symbol,
+            float(volume),
+            float(price)
+        )
+
+        # 3. Validate result
+        if margin is None:
+            last_err = await self._run(self.mt5.last_error)
+            logger.error(f"Failed to calculate margin for {symbol}: {last_err}")
+            return None
+
+        return margin
 
     async def get_historical_trade(self, ticket: int) -> Optional[PositionHistoryInfo]:
         """

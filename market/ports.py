@@ -119,3 +119,8 @@ class ITechnicalIndicatorService(Protocol):
                                      atr_period: int = 14) -> TechnicalIndicators:
         """Calculates a standard set of indicators from the given candles."""
         ...
+
+    async def calculate_custom_indicators(self,
+                                     candles: List[MarketCandle]) -> TechnicalIndicators:
+        """Calculates a custom set of indicators from the given candles."""
+        ...

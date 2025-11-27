@@ -88,6 +88,8 @@ class PositionInfo:
     current_price: float
     stop_loss: float
     take_profit: float
+    margin: float
+    peak_profit: float = 0.0
 
 @dataclass(frozen=True)
 class PositionHistoryInfo:
@@ -112,7 +114,12 @@ class TechnicalIndicators:
     # Using field to allow default empty lists
     ema_slow: List[float] = field(default_factory=list)
     ema_fast: List[float] = field(default_factory=list)
+    ema20: List[float] = field(default_factory=list)
+    ema50: List[float] = field(default_factory=list)
     macd: List[float] = field(default_factory=list)
     macd_signal: List[float] = field(default_factory=list)
+    macd_histogram: List[float] = field(default_factory=list)
     rsi: List[float] = field(default_factory=list)
+    rsi7: List[float] = field(default_factory=list)
+    rsi14: List[float] = field(default_factory=list)
     atr: List[float] = field(default_factory=list)

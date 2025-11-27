@@ -33,6 +33,7 @@ class ClosedTrade:
     lot_size: float
     profit: float
     swap: float
+    balance_at_entry: float  # <--- NEW: Crucial for % calculations
     # LLM context
     reasoning: Optional[str]
     confidence: Optional[float]
@@ -41,13 +42,14 @@ class ClosedTrade:
 @dataclass(frozen=True)
 class PerformanceMetrics:
     """Holds calculated performance metrics."""
-    sharpe_ratio: float
+    sharpe_ratio: float      # Annualized (or Per-Trade Risk adjusted)
+    sortino_ratio: float     # Downside deviation only
+    max_drawdown_pct: float  # <--- NEW: Critical Risk Metric
     total_trades: int
-    win_rate: float  # 0.0 to 1.0
-    profit_factor: float  # Total Profit / Total Loss
-    average_profit : float
-    average_loss : float
-    total_net_profit : float
+    win_rate: float          # 0.0 to 100.0
+    profit_factor: float     # Gross Profit / Gross Loss
+    average_return_pct: float # <--- NEW: Avg % gain per trade
+    total_net_profit: float
 
 
 # --------------------------- Interfaces / Ports (SOLID) ---------------------------
@@ -60,6 +62,7 @@ class ITradeRepository(Protocol):
 
     async def store_new_open_trade(self,
                                    position: PositionInfo,
+                                   account_balance: float,  # <--- NEW ARGUMENT
                                    reasoning: str,
                                    confidence: float) -> None:
         """
@@ -87,6 +90,19 @@ class ITradeRepository(Protocol):
     async def get_performance_metrics(self) -> PerformanceMetrics:
         """
         Calculates performance metrics from all 'CLOSED' trades in the DB.
+        """
+        ...
+
+    async def sync_open_trade_states(self) -> dict[int, float]:
+        """
+        Fetches a mapping of {ticket: peak_profit} for all currently 'OPEN' trades.
+        Used to initialize the in-memory state at the start of a cycle.
+        """
+        ...
+
+    async def update_peak_profit(self, ticket: int, new_peak: float) -> None:
+        """
+        Updates the peak_profit (High-Water Mark) for a specific open trade.
         """
         ...
 
@@ -135,6 +151,7 @@ class SQLiteTradeRepository(ITradeRepository):
             lot_size REAL NOT NULL,
             open_time TIMESTAMP NOT NULL,
             open_price REAL NOT NULL,
+            balance_at_entry REAL NOT NULL DEFAULT 0.0,
             reasoning TEXT,
             confidence REAL,
             status TEXT NOT NULL DEFAULT 'OPEN', -- 'OPEN' or 'CLOSED'
@@ -142,6 +159,7 @@ class SQLiteTradeRepository(ITradeRepository):
             close_price REAL,
             profit REAL,
             swap REAL,
+            peak_profit REAL DEFAULT 0.0,
             CHECK (status IN ('OPEN', 'CLOSED')),
             CHECK (action IN ('BUY', 'SELL'))
         );
@@ -170,8 +188,8 @@ class SQLiteTradeRepository(ITradeRepository):
         sql = """
         INSERT INTO trades (
             ticket, symbol, action, lot_size, open_time, open_price,
-            reasoning, confidence, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN');
+            balance_at_entry, reasoning, confidence, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN');
         """
         conn = None
         try:
@@ -190,6 +208,7 @@ class SQLiteTradeRepository(ITradeRepository):
 
     async def store_new_open_trade(self,
                                    position: PositionInfo,
+                                   account_balance: float,
                                    reasoning: str,
                                    confidence: float) -> None:
         params = (
@@ -199,6 +218,7 @@ class SQLiteTradeRepository(ITradeRepository):
             position.volume,
             position.open_time.isoformat(),
             position.open_price,
+            account_balance,  # <--- Saving the context of capital
             reasoning,
             confidence
         )
@@ -273,12 +293,10 @@ class SQLiteTradeRepository(ITradeRepository):
     async def get_open_trade_tickets(self) -> List[int]:
         return await self._run_in_executor(self._db_get_open_trade_tickets)
 
-    # <<< NEW BLOCK END >>>
 
-    # <<< NEW BLOCK START >>>
     def _db_get_performance_metrics(self) -> PerformanceMetrics:
-        """Blocking function to calculate performance metrics."""
-        sql = "SELECT profit FROM trades WHERE status = 'CLOSED';"
+        # We need Profit AND Balance At Entry to calculate returns %
+        sql = "SELECT profit, balance_at_entry FROM trades WHERE status = 'CLOSED';"
         conn = None
         try:
             conn = self._connect()
@@ -287,14 +305,12 @@ class SQLiteTradeRepository(ITradeRepository):
             rows = cursor.fetchall()
 
             if not rows:
-                logger.warning("No 'CLOSED' trade history found, returning default metrics.")
                 return self._default_metrics()
 
-            profits = [row[0] for row in rows]
-            return self._calculate_metrics(profits)
+            return self._calculate_institutional_metrics(rows)
 
         except Exception as e:
-            logger.exception(f"Failed to calculate performance metrics: {e}")
+            logger.exception(f"Failed to calculate metrics: {e}")
             return self._default_metrics()
         finally:
             if conn: conn.close()
@@ -302,55 +318,131 @@ class SQLiteTradeRepository(ITradeRepository):
     async def get_performance_metrics(self) -> PerformanceMetrics:
         return await self._run_in_executor(self._db_get_performance_metrics)
 
-    # <<< NEW BLOCK END >>>
+
+    def _db_sync_open_trade_states(self) -> dict[int, float]:
+        """Blocking: Returns {ticket: peak_profit} for all OPEN trades."""
+        sql = "SELECT ticket, peak_profit FROM trades WHERE status = 'OPEN';"
+        conn = None
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            # Return dict: {ticket_id: peak_value}
+            return {row[0]: (row[1] if row[1] is not None else 0.0) for row in rows}
+        except Exception as e:
+            logger.error(f"Failed to sync open trade states: {e}")
+            return {}
+        finally:
+            if conn: conn.close()
+
+    async def sync_open_trade_states(self) -> dict[int, float]:
+        return await self._run_in_executor(self._db_sync_open_trade_states)
+
+    # <<< NEW: Granular Update Logic >>>
+    def _db_update_peak_profit(self, params: tuple):
+        """Blocking: Updates peak_profit for a specific ticket."""
+        sql = "UPDATE trades SET peak_profit = ? WHERE ticket = ?;"
+        conn = None
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to update peak profit for {params[1]}: {e}")
+        finally:
+            if conn: conn.close()
+
+    async def update_peak_profit(self, ticket: int, new_peak: float) -> None:
+        await self._run_in_executor(self._db_update_peak_profit, (new_peak, ticket))
 
     def _default_metrics(self) -> PerformanceMetrics:
-        """Returns a default set of metrics when no history exists."""
         return PerformanceMetrics(
             sharpe_ratio=0.0,
+            sortino_ratio=0.0,
+            max_drawdown_pct=0.0,
             total_trades=0,
             win_rate=0.0,
-            profit_factor=0.0
+            profit_factor=0.0,
+            total_net_profit=0.0,
+            average_return_pct=0.0
         )
 
-    def _calculate_metrics(self, profits: List[float]) -> PerformanceMetrics:
-        """Helper to calculate metrics from a list of profits."""
+    def _calculate_institutional_metrics(self, data: List[tuple]) -> PerformanceMetrics:
+        """
+        Calculates metrics based on Percentage Returns (Capital at Risk).
+        """
+        profits = [row[0] for row in data]
+
+        # 1. Calculate Percentage Returns per trade
+        returns_pct = []
+        for p, b in data:
+            if b > 0:
+                returns_pct.append((p / b) * 100)
+            else:
+                returns_pct.append(0.0)
+
         total_trades = len(profits)
         if total_trades == 0:
             return self._default_metrics()
 
+        # --- Basic Stats ---
         wins = [p for p in profits if p > 0]
         losses = [p for p in profits if p < 0]
 
         total_net_profit = sum(profits)
-        total_wins = len(wins)
-        total_losses = len(losses)
+        win_rate = (len(wins) / total_trades) * 100
 
-        win_rate = (total_wins / total_trades) * 100
         sum_wins = sum(wins)
         sum_losses = abs(sum(losses))
+        profit_factor = sum_wins / sum_losses if sum_losses > 0 else 99.0
 
-        average_profit = sum_wins / total_wins if total_wins > 0 else 0
-        average_loss = sum_losses / total_losses if total_losses > 0 else 0
-        profit_factor = sum_wins / sum_losses if sum_losses > 0 else 0
+        # FIX 1: Explicit cast for average return
+        average_return_pct = float(np.mean(returns_pct))
 
-        # --- Sharpe Ratio (Sample std dev, assume risk-free = 0)
-        if total_trades > 1:
-            mean_return = float(np.mean(profits))
-            std_dev = float(np.std(profits, ddof=1))  # cast for type safety
-            sharpe_ratio = mean_return / std_dev if std_dev > 0 else 0
+        # --- Advanced Risk Metrics (Sharpe & Sortino) ---
+        returns_np = np.array(returns_pct)
+
+        # FIX 2: Explicit cast for std_dev
+        std_dev = float(np.std(returns_np, ddof=1)) if total_trades > 1 else 0.0
+
+        # Sharpe Ratio
+        if std_dev > 0:
+            sharpe_ratio = float(average_return_pct / std_dev)
         else:
-            sharpe_ratio = 0
+            sharpe_ratio = 0.0
 
-        # Optional annualization (if 252 trading days/year or adjust for your frequency)
-        # sharpe_ratio *= math.sqrt(252)
+        # Sortino Ratio
+        downside_returns = returns_np[returns_np < 0]
+        if len(downside_returns) > 1:
+            downside_std = float(np.std(downside_returns, ddof=1))
+            sortino_ratio = float(average_return_pct / downside_std) if downside_std > 0 else 0.0
+        else:
+            sortino_ratio = 0.0
+
+        # --- Max Drawdown % ---
+        running_equity = [100.0]
+        current_eq = 100.0
+
+        for ret in returns_pct:
+            current_eq = current_eq * (1 + (ret / 100))
+            running_equity.append(current_eq)
+
+        equity_curve = np.array(running_equity)
+        peak_curve = np.maximum.accumulate(equity_curve)
+        drawdowns = (equity_curve - peak_curve) / peak_curve
+
+        # FIX 3: Explicit cast for Max Drawdown
+        max_dd = float(np.min(drawdowns) * 100)
 
         return PerformanceMetrics(
+            sharpe_ratio=sharpe_ratio,
+            sortino_ratio=sortino_ratio,
+            max_drawdown_pct=abs(max_dd),
             total_trades=total_trades,
             win_rate=win_rate,
             profit_factor=profit_factor,
-            sharpe_ratio=sharpe_ratio,
-            average_profit=average_profit,
-            average_loss=average_loss,
+            average_return_pct=average_return_pct,  # Now safely a float
             total_net_profit=total_net_profit
         )
