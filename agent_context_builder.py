@@ -190,14 +190,15 @@ class AgentContextBuilder:
 
             # 2. Calculate indicators
             logger.debug(f"Calculating indicators for {symbol} @ {tf_config.timeframe}...")
-            indicators = await self._indicator_svc.calculate_indicators(
-                candles=candles,
-                fast_ema_period=tf_config.fast_ema,
-                slow_ema_period=tf_config.slow_ema,
-                macd_signal_period=tf_config.macd_signal,
-                rsi_period=tf_config.rsi_period,
-                atr_period=tf_config.atr_period
-            )
+            # indicators = await self._indicator_svc.calculate_indicators(
+            #     candles=candles,
+            #     fast_ema_period=tf_config.fast_ema,
+            #     slow_ema_period=tf_config.slow_ema,
+            #     macd_signal_period=tf_config.macd_signal,
+            #     rsi_period=tf_config.rsi_period,
+            #     atr_period=tf_config.atr_period
+            # )
+            indicators = await self._indicator_svc.calculate_custom_indicators(candles)
 
             return AgentMarketData(
                 timeframe=tf_config.timeframe,
@@ -263,7 +264,7 @@ async def main():
 
         # 5. Inspect the result (this object is now ready for the agent)
         logger.info("\n--- AGENT CONTEXT BUILD COMPLETE ---")
-        logger.info(f"Account Currency: {full_agent_context.account_state.account_currency}")
+        logger.info(f"Account Currency: {full_agent_context.account_state.currency}")
         logger.info(f"Open Positions: {len(full_agent_context.open_positions)}")
 
         for symbol, data in full_agent_context.market_context.items():

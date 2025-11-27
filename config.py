@@ -63,7 +63,7 @@ class Config:
     run_interval_seconds: int = field(default=int(os.getenv("RUN_INTERVAL_SECONDS", 300)))  # 5 minutes
 
     # Trading Configuration
-    system_prompt_path: str = field(default="system_prompt.txt")
+    system_prompt_path: str = field(default="fx.txt")
     dry_run: bool = field(default=os.getenv("DRY_RUN", "true").lower() == "true")
 
     # This is the list of symbols and timeframes the agent will analyze
@@ -71,22 +71,37 @@ class Config:
         SymbolWatchConfig(
             symbol="EURUSD",
             timeframes=[
-                TimeframeConfig(timeframe=mt5.TIMEFRAME_M5, candle_count=100),
-                TimeframeConfig(timeframe=mt5.TIMEFRAME_H1, candle_count=100)
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_M3, candle_count=200),
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_M15, candle_count=200),
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_H1, candle_count=200),
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_H4, candle_count=200),
             ]
         ),
         SymbolWatchConfig(
             symbol="GBPUSD",
             timeframes=[
-                TimeframeConfig(timeframe=mt5.TIMEFRAME_M5, candle_count=100),
-                TimeframeConfig(timeframe=mt5.TIMEFRAME_H1, candle_count=100)
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_M3, candle_count=200),
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_M15, candle_count=200),
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_H1, candle_count=200),
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_H4, candle_count=200),
             ]
         ),
         SymbolWatchConfig(
             symbol="USDJPY",
             timeframes=[
-                TimeframeConfig(timeframe=mt5.TIMEFRAME_M15, candle_count=100),
-                TimeframeConfig(timeframe=mt5.TIMEFRAME_H4, candle_count=100)
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_M3, candle_count=200),
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_M15, candle_count=200),
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_H1, candle_count=200),
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_H4, candle_count=200),
+            ]
+        ),
+        SymbolWatchConfig(
+            symbol="XAUUSD",
+            timeframes=[
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_M3, candle_count=200),
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_M15, candle_count=200),
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_H1, candle_count=200),
+                TimeframeConfig(timeframe=mt5.TIMEFRAME_H4, candle_count=200),
             ]
         ),
     ])

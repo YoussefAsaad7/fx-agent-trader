@@ -129,14 +129,15 @@ async def setup_dependencies(cfg: Config) -> Tuple[ForexAgentEngine, MT5Connecto
     # Must connect before proceeding
     await connector.connect()
 
+    # 3. Persistence
+    persistence = SQLiteTradeRepository(db_path="trade_history.db")
     # 2. Core Services
-    repo = MT5MarketDataRepository(connector)
+    repo = MT5MarketDataRepository(connector, persistence)
     indicator_svc = PandasTAIndicatorService()
     builder = AgentContextBuilder(repo, indicator_svc)
     executor = MT5TradeExecutionService(connector, repo)
 
-    # 3. Persistence
-    persistence = SQLiteTradeRepository(db_path="trade_history.db")
+
 
     reconciler = TradeReconciler(
         trade_repo=persistence,

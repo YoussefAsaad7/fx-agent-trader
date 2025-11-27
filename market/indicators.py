@@ -109,3 +109,63 @@ class PandasTAIndicatorService(ITechnicalIndicatorService):
         except Exception as e:
             logger.exception(f"Error during indicator calculation: {e}")
             return TechnicalIndicators()
+
+    async def calculate_custom_indicators(self,
+                                     candles: List[MarketCandle]) -> TechnicalIndicators:
+        if len(candles) < 51:
+            logger.warning(f"Not enough candles ({len(candles)}) to calculate indicators.")
+            return TechnicalIndicators()
+
+        # Run the blocking pandas logic in a separate thread
+        return await asyncio.to_thread(
+            self._calculate_custom_sync,
+            candles
+        )
+
+    def _calculate_custom_sync(self,
+                        candles: List[MarketCandle]) -> TechnicalIndicators:
+        """Synchronous calculation logic to be run in a thread."""
+        try:
+            # 1. Convert list of dataclasses to pandas DataFrame
+            df = pd.DataFrame([vars(c) for c in candles])
+            if df.empty:
+                return TechnicalIndicators()
+
+            df.set_index('time', inplace=True)
+            # Ensure correct dtypes
+            df['open'] = pd.to_numeric(df['open'])
+            df['high'] = pd.to_numeric(df['high'])
+            df['low'] = pd.to_numeric(df['low'])
+            df['close'] = pd.to_numeric(df['close'])
+
+            # 2. Calculate Indicators using pandas-ta
+            df.ta.ema(length=20, append=True, col_names='ema20')
+            df.ta.ema(length=50, append=True, col_names='ema50')
+            df.ta.rsi(length=7, append=True, col_names='rsi7')
+            df.ta.rsi(length=14, append=True, col_names='rsi14')
+            df.ta.atr(length=14, append=True, col_names='atr')
+            df.ta.macd(fast=12, slow=26, signal=9, append=True)
+
+
+
+            # 3. Clean and convert back to lists
+            df.fillna(0.0, inplace=True) # Replace NaNs with 0.0 for the agent
+
+            # --- MACD Column Names (CRITICAL) ---
+            macd_line_col = f'MACD_{12}_{26}_{9}'
+            histogram_col = f'MACDh_{12}_{26}_{9}'  # MACDh is the HISTOGRAM
+            signal_col = f'MACDs_{12}_{26}_{9}'  # MACDs is the SIGNAL line
+
+            return TechnicalIndicators(
+                ema20=df['ema20'].tolist(),
+                ema50=df['ema50'].tolist(),
+                macd=df[macd_line_col].tolist(),  # MACD Line
+                macd_signal=df[signal_col].tolist(),  # MACD Signal Line
+                macd_histogram=df[histogram_col].tolist(),  # MACD Histogram
+                rsi7=df['rsi7'].tolist(),
+                rsi14=df['rsi14'].tolist(),
+                atr=df['atr'].tolist()
+            )
+        except Exception as e:
+            logger.exception(f"Error during indicator calculation: {e}")
+            return TechnicalIndicators()
