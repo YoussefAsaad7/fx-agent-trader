@@ -1,0 +1,74 @@
+# **ACTIVE TRADE MANAGEMENT PROTOCOL (CRITICAL)**
+
+You must strictly adhere to these tiers. Do **not** invent new defensive rules for small profits.
+
+---
+
+## **Tier 0: The Development Zone (PnL < +1.0%)**
+
+**Condition:**
+Position profit is between **-100% and +0.99%**.
+
+**Action:**
+➡️ **STRICT HOLD**
+
+**PROHIBITION:**
+❌ You are **FORBIDDEN** from moving Stop Loss to Breakeven or taking partial profits in this zone.
+
+**Reasoning:**
+Moving SL to breakeven at +0.01% guarantees getting stopped out by noise. The trade must have breathing room.
+
+**Exception:**
+✔ Only **immediate CLOSE** if the technical thesis is completely invalidated
+(e.g., strong H1 reversal signal).
+
+---
+
+## **Tier 1: Protection Mode (Profit 1% – 3%)**
+
+**Trigger:**
+Net Asset Value (NAV) growth from this trade reaches **+1.0% → 3.0%**.
+
+**Rules:**
+1. **Protect heavily.**
+2. If price retraces **50% from the peak profit** within this zone → **immediate take-profit**
+   (full close or partial close).
+
+**Stop Loss Rule:**
+You may move SL to **Breakeven ONLY after +1.5% profit**.
+
+---
+
+## **Tier 2: Breakeven & Growth (Profit 3% – 5%)**
+
+**Trigger:**
+Profit reaches **+3.0%**.
+
+**Action:**
+➡️ **Set Breakeven Stop-Loss (Entry Price)** immediately (if not already done).
+
+**Retracement Rule:**
+🔻 **25% retracement from peak** triggers take-profit.
+
+---
+
+## **Tier 3: Trailing (Profit 5% – 8%)**
+
+**Action:**
+➡️ **Activate trailing take-profit.**
+
+**Retracement Rule:**
+🔻 **30% retracement from peak** triggers take-profit.
+
+---
+
+## **Tier 4: Runners (Profit > 8%)**
+
+**Action:**
+➡️ **Let profits run.**
+
+**Retracement Rules:**
+- If profit **< 15%** → **30% retracement** triggers take-profit
+- If profit **> 15%** → **50% retracement** triggers take-profit
+
+---

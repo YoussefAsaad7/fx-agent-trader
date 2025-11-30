@@ -47,7 +47,7 @@ class AbstractBaseClient(ILLMClient, abc.ABC):
                  model: str,
                  timeout: int = 120,
                  max_retries: int = 3,
-                 max_tokens: int = 4096):
+                 max_tokens: int = 16384):
 
         self._api_key = api_key
         self._model = model

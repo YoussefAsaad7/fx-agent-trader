@@ -63,7 +63,7 @@ class Config:
     run_interval_seconds: int = field(default=int(os.getenv("RUN_INTERVAL_SECONDS", 300)))  # 5 minutes
 
     # Trading Configuration
-    system_prompt_path: str = field(default="fx.txt")
+    system_prompt_path: str = field(default="trend.txt")
     dry_run: bool = field(default=os.getenv("DRY_RUN", "true").lower() == "true")
 
     # This is the list of symbols and timeframes the agent will analyze

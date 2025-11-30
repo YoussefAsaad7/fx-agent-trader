@@ -79,13 +79,15 @@ class TradeReconciler(ITradeReconciler):
                 closed_trade = await self._market_repo.get_historical_trade(ticket)
 
                 if closed_trade:
-                    # Mark it as "CLOSED" in our database
+                    # --- UPDATED: Pass close_reasoning ---
+                    # Since we didn't close it explicitly, it must be SL or TP
                     await self._trade_repo.update_trade_as_closed(
                         ticket=ticket,
                         close_time=closed_trade.close_time,
                         close_price=closed_trade.close_price,
                         profit=closed_trade.profit,
-                        swap=closed_trade.swap
+                        swap=closed_trade.swap,
+                        close_reasoning="Broker Triggered (SL/TP)"
                     )
                     logger.info(f"Successfully reconciled and closed trade {ticket}. Profit: {closed_trade.profit}")
                     reconciled_count += 1
