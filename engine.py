@@ -9,7 +9,7 @@ import logging
 import json
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Set
 from datetime import datetime, timezone, timedelta
 
 # Import all our custom modules
@@ -26,7 +26,8 @@ from agent_context_builder import (
 )
 from persistence import (
     ITradeRepository,
-    PerformanceMetrics
+    PerformanceMetrics,
+    ClosedTrade
 )
 from llm_client import ILLMClient
 logger = logging.getLogger(__name__)
@@ -71,15 +72,11 @@ class LLMFullDecision:
     cot_reasoning: str
     decisions: List[AgentDecision]
     timestamp: datetime = field(default_factory=datetime.utcnow)
-
-    # We add the context here so the executor can use it
     context: Optional[AgentFullContext] = None
-
 
 
 # -------------------------- Engine (Orchestrator) ---------------------------
 
-# Regex ported from Go example for robust LLM output parsing
 RE_JSON_FENCE = re.compile(r'(?is)' + r"```json\s*(\[\s*\{.*?\}\s*\])\s*```")# Find Array
 RE_JSON_ARRAY = re.compile(r'(?is)\[\s*\{.*?\}\s*\]') # Find Array
 RE_JSON_FENCE_OBJ = re.compile(r'(?is)' + r"```json\s*(\{.*?\})\s*```") # Find object
@@ -110,12 +107,12 @@ class ForexAgentEngine:
         self._system_prompt_template = system_prompt_template
 
         self.allowed_actions = {"buy_to_enter", "sell_to_enter", "partial_close", "update_stop_loss", "update_take_profit", "hold", "close", "wait"}
-        # --- NEW: Runtime Tracking ---
+        # Runtime Tracking ---
         self._start_time = datetime.utcnow()
         self._cycle_count = 0
-        # --- NEW: Time Synchronization ---
+        # Time Synchronization ---
         self._server_time_offset = timedelta(0)
-        self._is_time_synced = False  # <--- NEW FLAG
+        self._is_time_synced = False
 
     async def _run_time_sync(self):
         """
@@ -180,87 +177,95 @@ class ForexAgentEngine:
 
         return prompt
 
-    def _build_user_prompt(self, context: AgentFullContext, metrics: PerformanceMetrics) -> str:
+    def _build_user_prompt(self, context: AgentFullContext, metrics: PerformanceMetrics, closed_trades: List[ClosedTrade]) -> str:
         """
         Formats the rich AgentFullContext object into a text input for the LLM.
         """
-        # --- 1. Get Server Time (Zero Network Call) ---
         server_time = self._get_estimated_server_time()
-        # ----------------------------------------------
         lines = []
-        # --- NEW: System Status Header ---
+        processed_symbols: Set[str] = set()
+        # --- System Status Header ---
         now = datetime.utcnow()
-        active_sessions = self._get_market_sessions(now)  # <--- NEW FUNCTION CALL
+        active_sessions = self._get_market_sessions(now)
         elapsed = now - self._start_time
         runtime_minutes = int(elapsed.total_seconds() / 60)
-
-        # Go Example: "Time: %s | Cycle: #%d | Runtime: %d minutes"
-        status_line = (
+        lines.append("## System Status")
+        lines.append(
             f"Time: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC | "
-            f"Sessions: [{active_sessions}] | "  # <--- CRITICAL CONTEXT
+            f"Sessions: [{active_sessions}] | "
             f"Cycle: #{self._cycle_count} | "
             f"Runtime: {runtime_minutes} minutes"
         )
-
-        lines.append("## System Status")
-        lines.append(status_line)
         lines.append("---")
         # ---------------------------------
-        # --- 2. Performance Metrics (Replacing the old block) ---
+        # --- 2. Performance Metrics ---
         if metrics.total_trades > 0:
             lines.append("## 📈 Performance Metrics (Closed Trades)")
-
-            # 1. Risk-Adjusted Returns and Capital Protection
             lines.append(
                 f"Risk-Adj. Returns: Sharpe {metrics.sharpe_ratio:.2f} | "
                 f"Sortino {metrics.sortino_ratio:.2f} | "
-                f"Max DD {metrics.max_drawdown_pct:.2f}%"  # Max Drawdown is the percentage drop
+                f"Max DD {metrics.max_drawdown_pct:.2f}%"
             )
-
-            # 2. Profitability and Consistency
             lines.append(
                 f"Profit Factor: {metrics.profit_factor:.2f} | "
                 f"Win Rate: {metrics.win_rate:.1f}% | "
                 f"Avg. Return: {metrics.average_return_pct:.2f}%"
             )
-
-            # 3. Totals and Volume
             lines.append(
                 f"Total Trades: {metrics.total_trades} | "
                 f"Net PnL: {metrics.total_net_profit:+.2f}"
             )
-
             lines.append("---")
-        # End of Performance Metrics block
-        # 1. Account State
+
+        if closed_trades:
+            lines.append(f"## Recent Trade History (Last {len(closed_trades)})")
+
+            for i, trade in enumerate(closed_trades):
+                # Basic Trade Info
+                duration = trade.close_time - trade.open_time
+                dur_str = str(duration).split('.')[0]  # Remove microseconds
+
+                header = (
+                    f"{i + 1}. {trade.symbol} ({trade.action}) | "
+                    f"Profit: {trade.profit:+.2f} ({trade.return_pct:+.2f}%) | "
+                    f"Entry: {trade.open_price:.5f} | Exit: {trade.close_price:.5f} | "
+                    f"Duration: {dur_str}"
+                )
+                lines.append(header)
+
+                # Context & Reasoning
+                lines.append(f"   - Open Time: {trade.open_time.strftime('%Y-%m-%d %H:%M')}")
+                lines.append(f"   - Open Reason: {trade.open_reasoning or 'N/A'}")
+                lines.append(f"   - Initial Plan: SL {trade.initial_sl:.5f} | TP {trade.initial_tp:.5f}")
+                lines.append(f"   - Close Time: {trade.close_time.strftime('%Y-%m-%d %H:%M')}")
+                lines.append(f"   - Close Reason: {trade.close_reasoning or 'N/A'}")
+
+                # Modifications History
+                if trade.modifications:
+                    lines.append("   - Modifications:")
+                    for mod in trade.modifications:
+                        mod_time = mod.timestamp.strftime('%H:%M')
+                        val_change = f"{mod.old_value:.5f} -> {mod.new_value:.5f}"
+                        lines.append(f"     [{mod_time}] {mod.modification_type}: {val_change} | Why: {mod.reasoning}")
+
+                lines.append("")  # Spacing
+            lines.append("---")
+        # ---------------------------------------------
+
+        # --- 4. Account & Positions ---
         acc = context.account_state
-
-        # Safe calculations to avoid ZeroDivisionError
         equity = acc.equity if acc.equity > 0 else 1.0
-        balance = acc.balance if acc.balance > 0 else 1.0
-
-        # Derived Metrics
-        # Balance Ratio: How much of the equity is solidified balance?
         balance_pct = (acc.balance / equity) * 100
-
-        # PnL Percent: Current open profit relative to balance
-        raw_pnl = acc.equity - acc.balance
-        pnl_pct = (raw_pnl / balance) * 100
-
-        # Margin Used Percent: (Equity - Free Margin) / Equity
-        margin_used = acc.equity - acc.free_margin
-        margin_used_pct = (margin_used / equity) * 100
-
-        position_count = len(context.open_positions)
+        pnl_pct = ((acc.equity - acc.balance) / acc.balance) * 100 if acc.balance > 0 else 0
+        margin_used_pct = ((acc.equity - acc.free_margin) / equity) * 100
 
         lines.append(f"## Account")
-        # Go: Account: Equity %.2f | Balance %.2f (%.1f%%) | PnL %+.2f%% | Margin %.1f%% | Positions %d
         lines.append(
             f"Account: Equity {acc.equity:.2f} | "
             f"Balance {acc.balance:.2f} ({balance_pct:.1f}%) | "
             f"PnL {pnl_pct:+.2f}% | "
             f"Margin {margin_used_pct:.1f}% | "
-            f"Positions {position_count}"
+            f"Positions {len(context.open_positions)}"
         )
         lines.append("---")
 
@@ -339,7 +344,7 @@ class ForexAgentEngine:
                     f"Entry {pos.open_price:.5f} Current {pos.current_price:.5f} | "
                     f"Lots {pos.volume:.2f} | "
                     f"R-Mult: {r_multiple_str} | "
-                    f"NAV Growth: {nav_pnl_pct:+.2f}% (Peak {peak_nav_pct:.2f}%)| "  # Matches your "Profit 1-3%" tiers
+                    f"PnL: {nav_pnl_pct:+.2f}% (Peak {peak_nav_pct:.2f}%)| "  # Matches your "Profit 1-3%" tiers
                     f"Retracement: {retracement_pct:.1f}% | "  # Matches your "50% retracement" triggers
                     f"PnL Amt: {pos.profit:+.2f} (Peak: {valid_peak:.2f}) | "
                     f"Margin {pos.margin:+.0f} | "
@@ -347,10 +352,91 @@ class ForexAgentEngine:
                     f"SL {pos.stop_loss:.5f} TP {pos.take_profit:.5f}" 
                     f"{duration_str}"
                 )
-                print(pos_line)
+
                 lines.append(pos_line)
 
-                # D. Append Formatted Market Data for this specific symbol TODO
+                # --- EMBEDDED MARKET DATA FOR THIS POSITION ---
+                # This ensures the agent sees the chart data immediately after the position data
+                sym_context = context.market_context.get(pos.symbol)
+                if sym_context:
+                    processed_symbols.add(pos.symbol)  # Mark as shown
+                    info = sym_context.symbol_info
+
+                    # Exact format from Market Data section
+                    lines.append(f"\n   ### Symbol: {pos.symbol}")
+                    lines.append(
+                        f"   Spread: {info.spread} points | Swap: {info.swap_long} (L) / {info.swap_short} (S)")
+                    lines.append(
+                        f"   Tick Value: {info.trade_tick_value} {acc.currency} | Point: {info.point} | Pip: {info.point * 10} (1 Pip = 10 Points)")
+
+                    for tf_data in sym_context.market_data:
+                        tf_label = self.get_timeframe_label(tf_data.timeframe)
+                        lines.append(f"\n     Timeframe: {tf_label} (Last 10 data points)")
+
+                        pattern_slice = -100
+                        mid_prices_list = [c.close for c in tf_data.candles[pattern_slice:]]
+                        mid_prices_str = ", ".join([f"{p:.5f}" for p in mid_prices_list])
+                        lines.append(f"     Mid_Prices (Last {len(mid_prices_list)}): [{mid_prices_str}]")
+
+                        # Volume
+                        vol_lookback = 20
+                        volumes = [c.tick_volume for c in tf_data.candles]
+                        if len(volumes) >= vol_lookback:
+                            last_20_vols = volumes[-(vol_lookback + 1):-1]
+                            if len(last_20_vols) > 0:
+                                avg_vol = sum(last_20_vols) / len(last_20_vols)
+                            else:
+                                avg_vol = 1
+                            current_vol = volumes[-1]
+                            if avg_vol > 0:
+                                vol_ratio = current_vol / avg_vol
+                            else:
+                                vol_ratio = 0.0
+                            vol_str = f"     Volume_Analysis: [Current: {current_vol}, Avg_20: {int(avg_vol)}, Ratio: {vol_ratio:.2f}x]"
+                            lines.append(vol_str)
+                        else:
+                            lines.append("     Volume_Analysis: [Not enough data for Avg]")
+
+                        # Candles & Indicators
+                        slice_len = -10
+                        candles_str = [
+                            f"C: {c.close:.5f} H: {c.high:.5f} L: {c.low:.5f} O: {c.open:.5f} V: {c.tick_volume}"
+                            for c in tf_data.candles[slice_len:]
+                        ]
+                        lines.append(f"      Candles: [{', '.join(candles_str)}]")
+
+                        inds = tf_data.indicators
+                        if inds.ema_fast:
+                            lines.append(
+                                f"      EMA_Fast: [{', '.join([f'{x:.5f}' for x in inds.ema_fast[slice_len:]])}]")
+                        if inds.ema20:
+                            lines.append(
+                                f"      EMA (20-Period): [{', '.join([f'{x:.5f}' for x in inds.ema20[slice_len:]])}]")
+                        if inds.ema_slow:
+                            lines.append(
+                                f"      EMA_Slow: [{', '.join([f'{x:.5f}' for x in inds.ema_slow[slice_len:]])}]")
+                        if inds.ema50:
+                            lines.append(
+                                f"      EMA (50-Period): [{', '.join([f'{x:.5f}' for x in inds.ema50[slice_len:]])}]")
+                        if inds.macd:
+                            lines.append(f"      MACD:     [{', '.join([f'{x:.5f}' for x in inds.macd[slice_len:]])}]")
+                        if inds.macd_signal:
+                            lines.append(
+                                f"      MACD Signal:   [{', '.join([f'{x:.5f}' for x in inds.macd_signal[slice_len:]])}]")
+                        if inds.macd_histogram:
+                            lines.append(
+                                f"      MACD Histogram:   [{', '.join([f'{x:.5f}' for x in inds.macd_histogram[slice_len:]])}]")
+                        if inds.rsi:
+                            lines.append(f"      RSI:      [{', '.join([f'{x:.2f}' for x in inds.rsi[slice_len:]])}]")
+                        if inds.rsi7:
+                            lines.append(
+                                f"      RSI (7-Period):      [{', '.join([f'{x:.2f}' for x in inds.rsi7[slice_len:]])}]")
+                        if inds.rsi14:
+                            lines.append(
+                                f"      RSI (14-Period):      [{', '.join([f'{x:.2f}' for x in inds.rsi14[slice_len:]])}]")
+                        if inds.atr:
+                            lines.append(
+                                f"      ATR (14-Period):      [{', '.join([f'{x:.5f}' for x in inds.atr[slice_len:]])}]")
 
                 lines.append("")  # Empty line between positions
 
@@ -370,13 +456,16 @@ class ForexAgentEngine:
             lines.append("No high-impact events scheduled.")
         lines.append("---")
 
-        # 4. Market Data (Critical)
+        # --- Market Data (Remaining Symbols) ---
         lines.append("## Market Data & Indicators (Oldest -> Newest)")
         for symbol, sym_context in context.market_context.items():
+            # Skip if we already showed this symbol in the positions section
+            if symbol in processed_symbols:
+                continue
             info = sym_context.symbol_info
             lines.append(f"\n### Symbol: {symbol}")
             lines.append(f"Spread: {info.spread} points | Swap: {info.swap_long} (L) / {info.swap_short} (S)")
-            lines.append(f"Tick Value: {info.trade_tick_value} {acc.currency} | Point: {info.point}")
+            lines.append(f"Tick Value: {info.trade_tick_value} {acc.currency} | Point: {info.point} | Pip: {info.point*10} (1 Pip = 10 Points)")
 
             for tf_data in sym_context.market_data:
                 tf_label = self.get_timeframe_label(tf_data.timeframe)
@@ -498,24 +587,13 @@ class ForexAgentEngine:
         return tf_map.get(tf_int, str(tf_int))
 
     def _get_market_sessions(self, current_time_utc):
-        """Returns a string of active sessions based on UTC hour."""
-        hour = current_time_utc.hour
-        sessions = []
-
-        # Simple logic for major sessions (Approximate UTC)
-        # Sydney: 21:00 - 06:00
-        if hour >= 21 or hour < 6: sessions.append("Sydney")
-        # Tokyo: 00:00 - 09:00
-        if 0 <= hour < 9: sessions.append("Tokyo")
-        # London: 07:00 - 16:00
-        if 7 <= hour < 16: sessions.append("London")
-        # New York: 12:00 - 21:00
-        if 12 <= hour < 21: sessions.append("New York")
-
-        if not sessions:
-            return "Quiet/Off-Hours"
-
-        return ", ".join(sessions)
+        h = current_time_utc.hour
+        s = []
+        if h >= 21 or h < 6: s.append("Sydney")
+        if 0 <= h < 9: s.append("Tokyo")
+        if 7 <= h < 16: s.append("London")
+        if 12 <= h < 21: s.append("New York")
+        return ", ".join(s) if s else "Quiet"
 
     def _extract_cot(self, raw: str) -> str:
         """
@@ -609,7 +687,8 @@ class ForexAgentEngine:
                     new_stop_loss=item.get("new_stop_loss"),
                     new_take_profit=item.get("new_take_profit"),
                     risk_percent=item.get("risk_percent"),
-                    close_percent=item.get("close_percent")
+                    close_percent=item.get("close_percent"),
+                    reasoning=item.get("reasoning")
                 ))
             return decisions
         except json.JSONDecodeError as e:
@@ -699,14 +778,17 @@ class ForexAgentEngine:
             logger.info("Building context...")
             context = await self._builder.build_context(watch_list)
 
-            # 2. Get performance metrics
-            logger.info("Getting performance metrics...")
-            metrics = await self._persistence.get_performance_metrics()
+            # --- New: Fetch Full Data ---
+            logger.info("Fetching history...")
+            metrics_task = self._persistence.get_performance_metrics()
+            history_task = self._persistence.get_closed_trades_history(limit=10)
+
+            metrics, closed_trades = await asyncio.gather(metrics_task, history_task)
 
             # 3. Build prompts
             logger.info("Building prompts...")
             system_prompt = self._build_system_prompt()
-            user_prompt = self._build_user_prompt(context, metrics)
+            user_prompt = self._build_user_prompt(context, metrics, closed_trades)
 
             # 4. Call LLM
             logger.info("Calling LLM...")
@@ -738,7 +820,7 @@ class ForexAgentEngine:
                 cot_reasoning=f"Engine failed: {e}", decisions=[]
             )
 
-    async def execute(self, decision: AgentDecision, context: AgentFullContext, reasoning: str):
+    async def execute(self, decision: AgentDecision, context: AgentFullContext, reasoning: str): # TODO rename reasoning to CoT and store it in db
         """
         Executes a single validated decision.
         """
@@ -774,7 +856,9 @@ class ForexAgentEngine:
                         await self._persistence.store_new_open_trade(
                             position=pos,
                             account_balance=context.account_state.balance,
-                            reasoning=reasoning,
+                            initial_sl=decision.stop_loss,
+                            initial_tp=decision.take_profit,
+                            reasoning=decision.reasoning,
                             confidence=decision.confidence
                         )
                     else:
@@ -792,7 +876,7 @@ class ForexAgentEngine:
                     logger.warning(f"Wanted to close {decision.symbol}, but no open position was found.")
                     return
 
-                result = await self._executor.close_position(pos_to_close, comment=decision.invalidation_condition)
+                result = await self._executor.close_position(pos_to_close, comment="") # TODO
                 logger.info(f"Close result: {result}")
                 if result.success:
                     # The trade is closed. We must wait for the broker
@@ -808,7 +892,8 @@ class ForexAgentEngine:
                             close_time=closed_trade_history.close_time,
                             close_price=closed_trade_history.close_price,
                             profit=closed_trade_history.profit,
-                            swap=closed_trade_history.swap
+                            swap=closed_trade_history.swap,
+                            close_reasoning= decision.reasoning
                         )
                         logger.info(f"Successfully closed and logged trade {pos_to_close.ticket}")
                     else:
@@ -825,8 +910,12 @@ class ForexAgentEngine:
                 # Find position logic...
                 pos = next((p for p in context.open_positions if p.symbol == decision.symbol), None)
                 if pos:
-                    logger.info(f"Updating SL for {decision.symbol} to {decision.new_stop_loss}")
+                    logger.info(f"Updating SL for {decision.symbol} to {decision.new_stop_loss} Reason: {decision.reasoning}")
                     await self._executor.update_position_sl(pos.ticket, stop_loss=decision.new_stop_loss)
+                    # --- NEW: Log Modification ---
+                    await self._persistence.log_modification(
+                        pos.ticket, "UPDATE_SL", pos.stop_loss, decision.new_stop_loss, decision.reasoning
+                    )
 
             elif action == "update_take_profit":
                 if decision.new_take_profit is None:
@@ -836,8 +925,12 @@ class ForexAgentEngine:
                 # Find position logic...
                 pos = next((p for p in context.open_positions if p.symbol == decision.symbol), None)
                 if pos:
-                    logger.info(f"Updating TP for {decision.symbol} to {decision.new_take_profit}")
+                    logger.info(f"Updating TP for {decision.symbol} to {decision.new_take_profit} Reason: {decision.reasoning}")
                     await self._executor.update_position_tp(pos.ticket, take_profit=decision.new_take_profit)
+                    # --- NEW: Log Modification ---
+                    await self._persistence.log_modification(
+                        pos.ticket, "UPDATE_TP", pos.take_profit, decision.new_take_profit, decision.reasoning
+                    )
 
             elif action == "partial_close":
                 if decision.close_percent is None:
@@ -847,9 +940,14 @@ class ForexAgentEngine:
                 # Find position logic...
                 pos = next((p for p in context.open_positions if p.symbol == decision.symbol), None)
                 if pos:
-                    logger.info(f"Partial close {decision.symbol} by {decision.close_percent}")
+                    logger.info(f"Partial close {decision.symbol} by {decision.close_percent} Reason: {decision.reasoning}")
                     lot_to_close = pos.volume * decision.close_percent / 100
                     await self._executor.partial_close_position(pos.ticket, lot_to_close=lot_to_close, comment=f"{decision.reasoning}")
+                    # --- NEW: Log Modification ---
+                    await self._persistence.log_modification(
+                        pos.ticket, "PARTIAL_CLOSE", pos.volume, pos.volume - lot_to_close,
+                        f"Closed {decision.close_percent}%: {decision.reasoning}"
+                    )
 
         except Exception as e:
             logger.exception(f"Execution failed for {action} {decision.symbol}")
