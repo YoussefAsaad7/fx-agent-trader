@@ -339,6 +339,23 @@ class ForexAgentEngine:
                 # Calculate Peak NAV PCT for the prompt
                 peak_nav_pct = (valid_peak / balance) * 100
 
+                # --- CHANGE START: Determine Active Strategy Tier ---
+                tier_label = "Tier 0 (Development)"
+                tier_rules = "STRICT HOLD. NO BE. NO PARTIALS."
+
+                if nav_pnl_pct >= 8.0:
+                    tier_label = "Tier 4 (Runners)"
+                    tier_rules = "Let run. Exit if >15% profit & 50% retracement OR <15% profit & 30% retracement."
+                elif nav_pnl_pct >= 5.0:
+                    tier_label = "Tier 3 (Trailing)"
+                    tier_rules = "Trail SL. Exit on 30% retracement from peak."
+                elif nav_pnl_pct >= 3.0:
+                    tier_label = "Tier 2 (Breakeven & Growth)"
+                    tier_rules = "Move SL to BE immediately. Exit on 25% retracement."
+                elif nav_pnl_pct >= 1.0:
+                    tier_label = "Tier 1 (Protection)"
+                    tier_rules = "Protect. SL to BE only if >1.5%. Exit on 50% retracement."
+
                 pos_line = (
                     f"{i + 1}. {pos.symbol} {pos_type} | "
                     f"Entry {pos.open_price:.5f} Current {pos.current_price:.5f} | "
@@ -346,6 +363,8 @@ class ForexAgentEngine:
                     f"R-Mult: {r_multiple_str} | "
                     f"PnL: {nav_pnl_pct:+.2f}% (Peak {peak_nav_pct:.2f}%)| "  # Matches your "Profit 1-3%" tiers
                     f"Retracement: {retracement_pct:.1f}% | "  # Matches your "50% retracement" triggers
+                    f"Status: [{tier_label}] | " # NEW
+                    f"Rule: [{tier_rules}] | "    # NEW
                     f"PnL Amt: {pos.profit:+.2f} (Peak: {valid_peak:.2f}) | "
                     f"Margin {pos.margin:+.0f} | "
                     f"Swap {pos.swap:+.2f} | "
@@ -387,12 +406,22 @@ class ForexAgentEngine:
                                 avg_vol = sum(last_20_vols) / len(last_20_vols)
                             else:
                                 avg_vol = 1
-                            current_vol = volumes[-1]
+                            current_vol = volumes[-2]
                             if avg_vol > 0:
                                 vol_ratio = current_vol / avg_vol
                             else:
                                 vol_ratio = 0.0
-                            vol_str = f"     Volume_Analysis: [Current: {current_vol}, Avg_20: {int(avg_vol)}, Ratio: {vol_ratio:.2f}x]"
+
+                            # NEW: Determine drift (Volume Price Correlation)
+                            # Check if the high volume candle was Green (Close > Open) or Red (Close < Open)
+                            last_candle = tf_data.candles[-2]
+                            is_bullish = last_candle.close > last_candle.open
+                            vol_type = "BULLISH_SURGE" if (is_bullish and vol_ratio > 1.5) else \
+                                "BEARISH_SURGE" if (not is_bullish and vol_ratio > 1.5) else "NEUTRAL"
+                            vol_str = (
+                                f"   Volume_Analysis: [Current: {current_vol}, "
+                                f"Avg_20: {int(avg_vol)}, Ratio: {vol_ratio:.2f}x, Type: {vol_type}]"
+                            )
                             lines.append(vol_str)
                         else:
                             lines.append("     Volume_Analysis: [Not enough data for Avg]")
@@ -507,7 +536,7 @@ class ForexAgentEngine:
                     else:
                         avg_vol = 1
 
-                    current_vol = volumes[-1]  # The volume of the latest candle
+                    current_vol = volumes[-2]  # The volume of the latest completed candle
 
                     # Calculate Ratio (RVol)
                     if avg_vol > 0:
@@ -517,7 +546,16 @@ class ForexAgentEngine:
 
                     # 3. Create the string
                     # We provide the raw average AND the explicit ratio for the AI
-                    vol_str = f"   Volume_Analysis: [Current: {current_vol}, Avg_20: {int(avg_vol)}, Ratio: {vol_ratio:.2f}x]"
+                    # NEW: Determine drift (Volume Price Correlation)
+                    # Check if the high volume candle was Green (Close > Open) or Red (Close < Open)
+                    last_candle = tf_data.candles[-2]
+                    is_bullish = last_candle.close > last_candle.open
+                    vol_type = "BULLISH_SURGE" if (is_bullish and vol_ratio > 1.5) else \
+                        "BEARISH_SURGE" if (not is_bullish and vol_ratio > 1.5) else "NEUTRAL"
+                    vol_str = (
+                        f"   Volume_Analysis: [Current: {current_vol}, "
+                        f"Avg_20: {int(avg_vol)}, Ratio: {vol_ratio:.2f}x, Type: {vol_type}]"
+                    )
 
                     # 4. Append BEFORE candles
                     lines.append(vol_str)
