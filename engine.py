@@ -406,7 +406,7 @@ class ForexAgentEngine:
                                 avg_vol = sum(last_20_vols) / len(last_20_vols)
                             else:
                                 avg_vol = 1
-                            current_vol = volumes[-1]
+                            current_vol = volumes[-2]
                             if avg_vol > 0:
                                 vol_ratio = current_vol / avg_vol
                             else:
@@ -414,7 +414,7 @@ class ForexAgentEngine:
 
                             # NEW: Determine drift (Volume Price Correlation)
                             # Check if the high volume candle was Green (Close > Open) or Red (Close < Open)
-                            last_candle = tf_data.candles[-1]
+                            last_candle = tf_data.candles[-2]
                             is_bullish = last_candle.close > last_candle.open
                             vol_type = "BULLISH_SURGE" if (is_bullish and vol_ratio > 1.5) else \
                                 "BEARISH_SURGE" if (not is_bullish and vol_ratio > 1.5) else "NEUTRAL"
@@ -536,7 +536,7 @@ class ForexAgentEngine:
                     else:
                         avg_vol = 1
 
-                    current_vol = volumes[-1]  # The volume of the latest candle
+                    current_vol = volumes[-2]  # The volume of the latest completed candle
 
                     # Calculate Ratio (RVol)
                     if avg_vol > 0:
@@ -548,7 +548,7 @@ class ForexAgentEngine:
                     # We provide the raw average AND the explicit ratio for the AI
                     # NEW: Determine drift (Volume Price Correlation)
                     # Check if the high volume candle was Green (Close > Open) or Red (Close < Open)
-                    last_candle = tf_data.candles[-1]
+                    last_candle = tf_data.candles[-2]
                     is_bullish = last_candle.close > last_candle.open
                     vol_type = "BULLISH_SURGE" if (is_bullish and vol_ratio > 1.5) else \
                         "BEARISH_SURGE" if (not is_bullish and vol_ratio > 1.5) else "NEUTRAL"
